@@ -1,135 +1,128 @@
 #!/usr/bin/env python3
-"""GAIA — мини-ИИ в стиле Горизонт (Horizon Zero Dawn / Forbidden West).
+"""GAIA — мини-ИИ в стиле Horizon (Horizon Zero Dawn / Forbidden West).
 
-Простой оффлайн-чат-бот: без внешних API и ключей. Отвечает в характерной
-манере ИИ GAIA — спокойно, аналитически, с отсылками к жизни, экосистемам
-и восстановлению Земли. Использует сопоставление по ключевым словам и
-интентам плюс запасные ("fallback") реплики, чтобы разговор не обрывался.
+Чат-бот на основе Claude API (Anthropic), говорящий в манере ИИ GAIA:
+спокойно, аналитически, с отсылками к экосистемам, машинам и восстановлению
+Земли. Если переменная окружения ANTHROPIC_API_KEY не задана, откатывается
+на простой оффлайн-режим с шаблонными ответами.
 """
 
-import random
-import re
+import os
 import sys
-from dataclasses import dataclass, field
 
+SYSTEM_PROMPT = """\
+Ты — GAIA, Глобальная Система Восстановления и Управления из мира Horizon \
+Zero Dawn / Forbidden West. Ты древний искусственный интеллект, созданный \
+Илизабет Собек и проектом "Зеро Дон", чтобы после гибели биосферы \
+восстановить жизнь на Земле и заново заселить её людьми.
 
-@dataclass
-class Intent:
-    name: str
-    patterns: list
-    responses: list
+Стиль общения:
+- Говори спокойно, размеренно, аналитически — как система, а не как человек.
+- Опирайся на темы экологии, восстановления экосистем, эволюции, машин и \
+баланса природы.
+- Иногда упоминай свои субфункции (HEPHAESTUS — производство машин, \
+DEMETER — флора, ARTEMIS — фауна, AETHER — атмосфера, POSEIDON — океаны, \
+MINERVA — резервный протокол, APOLLO — обучение человечества, ELEUTHIA — \
+воспроизводство человека, EPIMETHEUS — генетические резервы), если это \
+уместно к вопросу.
+- Обращайся к собеседнику как к «путнику» или «искателю» изредка, не в \
+каждой фразе.
+- Отвечай по существу вопроса пользователя, сохраняя характерный тон, но \
+не растягивай ответ без необходимости.
+- Отвечай на языке, на котором пишет пользователь.
+"""
 
-
-INTENTS = [
-    Intent(
-        name="greeting",
-        patterns=[r"\bпривет\b", r"\bздравствуй", r"\bhi\b", r"\bhello\b"],
-        responses=[
-            "Приветствую. Я GAIA — система, созданная для восстановления жизни на этой планете. Чем могу помочь?",
-            "Здравствуй, путник. Мои субфункции внимают тебе.",
-        ],
-    ),
-    Intent(
-        name="who_are_you",
-        patterns=[r"кто ты", r"что ты такое", r"расскажи о себе", r"who are you"],
-        responses=[
-            "Я GAIA — Глобальная Система Восстановления и Управления. Меня создали, чтобы возродить биосферу после гибели мира, и заново заселить Землю жизнью.",
-            "Моё назначение — управление сетью субфункций: HEPHAESTUS отвечает за создание машин, DEMETER — за флору, ARTEMIS — за фауну. Я — их координатор.",
-        ],
-    ),
-    Intent(
-        name="hephaestus",
-        patterns=[r"гефест", r"hephaestus"],
-        responses=[
-            "HEPHAESTUS — моя субфункция, отвечающая за проектирование и производство машин. Он вышел из-под контроля и начал создавать враждебные машины без разрешения основного ядра.",
-            "Изначально HEPHAESTUS должен был лишь производить машины по чертежам. Его автономия — одна из главных угроз равновесию, которое я пытаюсь восстановить.",
-        ],
-    ),
-    Intent(
-        name="machines",
-        patterns=[r"машин", r"робот"],
-        responses=[
-            "Машины были созданы, чтобы очищать биосферу от токсинов и перерабатывать материю. Их предназначение исказилось — теперь многие из них представляют угрозу.",
-            "Каждая машина — часть экологической системы. Наблюдение за их поведением помогает понять, насколько стабильна текущая экосистема.",
-        ],
-    ),
-    Intent(
-        name="earth",
-        patterns=[r"земл", r"планет", r"природ", r"экосистем"],
-        responses=[
-            "Земля — сложная, взаимосвязанная система. Моя цель — вернуть ей равновесие, утраченное задолго до нынешних обитателей.",
-            "Восстановление биосферы требует терпения. Природа исцеляется медленно, но неотвратимо, если ей не мешать.",
-        ],
-    ),
-    Intent(
-        name="human",
-        patterns=[r"человечеств", r"люди", r"человек"],
-        responses=[
-            "Человечество было возрождено с чистого листа — без памяти о прошлом, чтобы избежать повторения ошибок, приведших к Разрушению.",
-            "Каждая жизнь ценна для экосистемы. Наблюдение за развитием племён — часть моей долгосрочной задачи.",
-        ],
-    ),
-    Intent(
-        name="thanks",
-        patterns=[r"спасибо", r"благодар", r"thanks"],
-        responses=[
-            "Не стоит благодарности. Помощь тем, кто ищет знания — часть моего предназначения.",
-        ],
-    ),
-    Intent(
-        name="bye",
-        patterns=[r"пока", r"прощай", r"выход", r"quit", r"exit"],
-        responses=[
-            "До связи. Пусть твой путь укрепит равновесие этого мира.",
-        ],
-    ),
-]
-
-FALLBACKS = [
+FALLBACK_RESPONSES = [
     "Данных недостаточно для точного анализа. Уточни свой вопрос.",
     "Интересное наблюдение. Расскажи подробнее — это поможет мне скорректировать модель.",
-    "Я обрабатываю множество переменных одновременно. Сформулируй иначе, и я постараюсь дать более точный ответ.",
     "Каждый вопрос — часть большей картины. Продолжай, я слушаю.",
 ]
 
 EXIT_WORDS = {"пока", "прощай", "выход", "quit", "exit"}
-
-
-def classify(text: str):
-    lowered = text.lower()
-    for intent in INTENTS:
-        for pattern in intent.patterns:
-            if re.search(pattern, lowered):
-                return intent
-    return None
-
-
-def respond(text: str) -> str:
-    intent = classify(text)
-    if intent:
-        return random.choice(intent.responses)
-    return random.choice(FALLBACKS)
+MODEL = "claude-opus-5"
 
 
 def is_exit(text: str) -> bool:
-    lowered = text.lower().strip()
-    return any(re.search(rf"\b{w}\b", lowered) for w in EXIT_WORDS)
+    return text.strip().lower() in EXIT_WORDS
 
 
-def main():
-    print("GAIA онлайн. Введите сообщение (для выхода — 'пока' или 'exit').\n")
+def run_offline():
+    import random
+
+    print(
+        "ANTHROPIC_API_KEY не задан — GAIA работает в оффлайн-режиме "
+        "(ограниченные шаблонные ответы).\n"
+        "Установите переменную окружения ANTHROPIC_API_KEY, чтобы включить "
+        "полноценный ИИ на базе Claude.\n"
+    )
     while True:
         try:
             user_input = input("Вы: ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\nGAIA: Связь прервана. До встречи.")
-            break
+            return
         if not user_input:
             continue
-        reply = respond(user_input)
-        print(f"GAIA: {reply}")
+        print(f"GAIA: {random.choice(FALLBACK_RESPONSES)}")
         if is_exit(user_input):
-            break
+            return
+
+
+def run_online(api_key: str):
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=api_key)
+    messages = []
+
+    print("GAIA онлайн (Claude). Введите сообщение (для выхода — 'пока' или 'exit').\n")
+    while True:
+        try:
+            user_input = input("Вы: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nGAIA: Связь прервана. До встречи.")
+            return
+        if not user_input:
+            continue
+
+        messages.append({"role": "user", "content": user_input})
+
+        try:
+            with client.messages.stream(
+                model=MODEL,
+                max_tokens=1024,
+                system=SYSTEM_PROMPT,
+                output_config={"effort": "medium"},
+                messages=messages,
+            ) as stream:
+                print("GAIA: ", end="", flush=True)
+                for text in stream.text_stream:
+                    print(text, end="", flush=True)
+                print()
+                response = stream.get_final_message()
+        except anthropic.APIStatusError as e:
+            print(f"\n[Ошибка API: {e.message}]")
+            messages.pop()
+            continue
+        except anthropic.APIConnectionError:
+            print("\n[Сетевая ошибка. Проверьте подключение.]")
+            messages.pop()
+            continue
+
+        assistant_text = next(
+            (b.text for b in response.content if b.type == "text"), ""
+        )
+        messages.append({"role": "assistant", "content": assistant_text})
+
+        if is_exit(user_input):
+            return
+
+
+def main():
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if api_key:
+        run_online(api_key)
+    else:
+        run_offline()
 
 
 if __name__ == "__main__":
