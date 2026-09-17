@@ -43,6 +43,25 @@ anything to a disk:
   (e.g. F12/Esc at power-on). After copying, it boots straight into
   hentrOS itself so you can try it immediately.
 
+## Ready-made ISO
+
+[`hentros.iso`](hentros.iso) in the repo root is a prebuilt, bootable disc
+image — no toolchain needed to try it. It's a standard UEFI-only El
+Torito ISO (a small FAT12 EFI System Partition embedded in an ISO 9660
+disc), built with:
+
+```sh
+make iso
+```
+
+Use it either as a virtual CD/DVD in a UEFI-enabled VM (VirtualBox,
+VMware, QEMU: `qemu-system-x86_64 -bios OVMF.fd -cdrom hentros.iso`), or
+write it to a USB stick with `dd if=hentros.iso of=/dev/sdX bs=4M status=progress`
+(**check the device name carefully** — this overwrites the whole drive)
+and boot from it on real UEFI hardware. Either way you land on the same
+boot menu described below, and choosing **Live mode** never writes
+anything back to the stick or the machine's own disk.
+
 ## Building
 
 Requires `clang`+`lld` (bootloader, built for the `x86_64-unknown-windows`
