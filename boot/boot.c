@@ -56,17 +56,58 @@ static void center_string(int y, const char *s, uint32_t color, int scale) {
     draw_string(((int)screenW - w) / 2, y, s, color, scale);
 }
 
-/* ============================== Boot menu ============================== */
+/* ---- On-screen diagnostics ----
+ * Different boards behave differently enough (keyboard layout quirks,
+ * USB enumeration timing, firmware that never exposes a pointer
+ * protocol at all) that guessing blind from reports like "it doesn't
+ * work" stops being productive. This puts the actual live state on
+ * screen - no serial cable or debug build needed - so it's visible in
+ * a photo of the screen: how many pointer devices were found, and the
+ * raw scan code / character of the last key that was actually
+ * received, which tells us immediately whether input is reaching the
+ * code at all and, if so, what a given key actually reports as. */
+static int g_pointerCount = -1; /* -1 = not scanned yet */
+static int g_lastScan = -1, g_lastUnicode = -1;
 
-static char wait_for_choice(void) {
-    for (;;) {
-        EFI_INPUT_KEY key;
-        if (ST->ConIn->ReadKeyStroke(ST->ConIn, &key) == EFI_SUCCESS) {
-            if (key.UnicodeChar == '1' || key.UnicodeChar == '2') return (char)key.UnicodeChar;
-        }
-        BS->Stall(20000);
-    }
+static void itoa10(int v, char *out) {
+    char tmp[12]; int i = 0; int neg = v < 0; if (neg) v = -v;
+    if (v == 0) tmp[i++] = '0';
+    while (v > 0) { tmp[i++] = (char)('0' + (v % 10)); v /= 10; }
+    int j = 0;
+    if (neg) out[j++] = '-';
+    while (i > 0) out[j++] = tmp[--i];
+    out[j] = 0;
 }
+
+static void strcat_local(char *dst, const char *src) {
+    while (*dst) dst++;
+    while (*src) *dst++ = *src++;
+    *dst = 0;
+}
+
+static void draw_diagnostics(void) {
+    char line[80]; char num[12];
+
+    line[0] = 0;
+    strcat_local(line, "MOUSE: ");
+    if (g_pointerCount < 0) {
+        strcat_local(line, "SEARCHING...");
+    } else {
+        itoa10(g_pointerCount, num);
+        strcat_local(line, num);
+        strcat_local(line, g_pointerCount == 0 ? " FOUND (USE ARROWS+ENTER)" : " FOUND");
+    }
+    draw_string(6, 4, line, 0xFFFF40, 1);
+
+    line[0] = 0;
+    strcat_local(line, "LAST KEY: SCAN=");
+    itoa10(g_lastScan, num); strcat_local(line, num);
+    strcat_local(line, " CHAR=");
+    itoa10(g_lastUnicode, num); strcat_local(line, num);
+    draw_string(6, 4 + FONT_H + 3, line, 0xFFFF40, 1);
+}
+
+/* ============================== Boot menu ============================== */
 
 static void wait_for_any_key(void) {
     for (;;) {
@@ -76,19 +117,49 @@ static void wait_for_any_key(void) {
     }
 }
 
-static void draw_menu(void) {
+/* selected: 0 for option 1, 1 for option 2 (-1 draws neither highlighted,
+ * used before any key has been read yet). */
+static void draw_menu(int selected) {
     fill_rect(0, 0, screenW, screenH, COL_BG);
     draw_hentros_logo((int)screenW / 2, (int)screenH / 3, 6, COL_YELLOW);
 
     int y = (int)screenH * 2 / 3;
     center_string(y, "HENTROS", COL_TEXT, 4);
     y += 50;
-    center_string(y, "[1] LIVE MODE - RUN FROM RAM, YOUR DISK IS NOT TOUCHED", COL_TEXT, 1);
+
+    const char *opt1 = "[1] LIVE MODE - RUN FROM RAM, YOUR DISK IS NOT TOUCHED";
+    const char *opt2 = "[2] INSTALL - COPY HENTROS TO A DISK, KEEPS YOUR OTHER OS";
+    int w1 = text_width(opt1, 1), w2 = text_width(opt2, 1);
+    if (selected == 0) fill_rect(((int)screenW - w1) / 2 - 6, y - 2, w1 + 12, FONT_H + 4, COL_MENU_HI);
+    center_string(y, opt1, COL_TEXT, 1);
     y += 20;
-    center_string(y, "[2] INSTALL - COPY HENTROS TO A DISK, KEEPS YOUR OTHER OS", COL_TEXT, 1);
+    if (selected == 1) fill_rect(((int)screenW - w2) / 2 - 6, y - 2, w2 + 12, FONT_H + 4, COL_MENU_HI);
+    center_string(y, opt2, COL_TEXT, 1);
     y += 30;
-    center_string(y, "PRESS 1 OR 2", COL_HINT, 1);
+    center_string(y, "PRESS 1 OR 2, OR USE ARROW KEYS + ENTER", COL_HINT, 1);
+    draw_diagnostics();
     present();
+}
+
+/* Accepts either a direct digit press or arrow-key navigation confirmed
+ * with Enter/Space, since keyboards and firmware vary enough that one
+ * single input method isn't reliably enough on every board. */
+static char wait_for_choice(void) {
+    int selected = 0;
+    draw_menu(selected);
+    for (;;) {
+        EFI_INPUT_KEY key;
+        if (ST->ConIn->ReadKeyStroke(ST->ConIn, &key) == EFI_SUCCESS) {
+            g_lastScan = key.ScanCode;
+            g_lastUnicode = (int)key.UnicodeChar;
+            if (key.UnicodeChar == '1' || key.UnicodeChar == '2') return (char)key.UnicodeChar;
+            if (key.ScanCode == 1 || key.ScanCode == 4) selected = 0; /* up/left */
+            if (key.ScanCode == 2 || key.ScanCode == 3) selected = 1; /* down/right */
+            if (key.UnicodeChar == 13 || key.UnicodeChar == ' ') return selected == 0 ? '1' : '2';
+            draw_menu(selected); /* live-updates the diagnostics line on every keystroke */
+        }
+        BS->Stall(20000);
+    }
 }
 
 static void status_line(int row, const char *s, uint32_t color) {
@@ -302,6 +373,7 @@ static void render_frame(void) {
     draw_window();
     draw_taskbar();
     if (start_menu_open) draw_start_menu();
+    draw_diagnostics();
     draw_cursor(mouse_x, mouse_y);
     present();
 }
@@ -383,6 +455,7 @@ static void desktop_loop(void) {
     for (int attempt = 0; attempt < 8; attempt++) {
         connect_all_controllers();
         find_pointers(&ptrs);
+        g_pointerCount = ptrs.spCount + ptrs.apCount;
         if (ptrs.spCount > 0 || ptrs.apCount > 0) break;
         BS->Stall(250000);
     }
@@ -395,7 +468,16 @@ static void desktop_loop(void) {
     render_frame();
 
     for (;;) {
+        /* left_now tracks the pointer device's real, level-based button
+         * state (down for as long as the device reports it down) and is
+         * what persists into left_prev below. kbClick is a one-shot
+         * pulse: UEFI's keyboard protocol only ever delivers a press
+         * event, never a matching release, so if Enter/Space were
+         * merged into the same persisted state the very first press
+         * would latch it "held" forever and no click - keyboard or
+         * mouse - would ever register again afterwards. */
         int left_now = left_prev;
+        int kbClick = 0;
 
         /* If no pointer device was found yet, keep periodically
          * re-checking - it may appear late (slow enumeration) or get
@@ -406,6 +488,7 @@ static void desktop_loop(void) {
                 rescanCounter = 0;
                 connect_all_controllers();
                 find_pointers(&ptrs);
+                g_pointerCount = ptrs.spCount + ptrs.apCount;
             }
         }
 
@@ -434,17 +517,19 @@ static void desktop_loop(void) {
         }
 
         /* Keyboard is always available (arrow keys move the cursor,
-         * Enter clicks) so the desktop stays usable even without a
-         * working pointer device. */
+         * Enter/Space clicks) so the desktop stays usable even without
+         * a working pointer device. */
         EFI_INPUT_KEY key;
         while (ST->ConIn->ReadKeyStroke(ST->ConIn, &key) == EFI_SUCCESS) {
+            g_lastScan = key.ScanCode;
+            g_lastUnicode = (int)key.UnicodeChar;
             switch (key.ScanCode) {
                 case 1: mouse_y -= 10; break; /* up */
                 case 2: mouse_y += 10; break; /* down */
                 case 3: mouse_x += 10; break; /* right */
                 case 4: mouse_x -= 10; break; /* left */
             }
-            if (key.UnicodeChar == 13 || key.UnicodeChar == ' ') left_now = 1;
+            if (key.UnicodeChar == 13 || key.UnicodeChar == ' ') kbClick = 1;
         }
 
         if (mouse_x < 0) mouse_x = 0;
@@ -452,7 +537,7 @@ static void desktop_loop(void) {
         if ((uint32_t)mouse_x > screenW - 2) mouse_x = screenW - 2;
         if ((uint32_t)mouse_y > screenH - 2) mouse_y = screenH - 2;
 
-        int left_click = left_now && !left_prev;
+        int left_click = (left_now && !left_prev) || kbClick;
         int left_release = !left_now && left_prev;
 
         if (left_click) {
@@ -563,7 +648,6 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     EFI_LOADED_IMAGE_PROTOCOL *loadedImage = NULL;
     BS->HandleProtocol(ImageHandle, &liGuid, (VOID **)&loadedImage);
 
-    draw_menu();
     char choice = wait_for_choice();
     if (choice == '2' && loadedImage) {
         do_install(loadedImage);
