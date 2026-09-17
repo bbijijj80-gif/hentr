@@ -321,53 +321,115 @@ static void connect_all_controllers(void) {
     BS->FreePool(handles);
 }
 
-static void desktop_loop(void) {
-    connect_all_controllers();
+#define MAX_POINTERS 8
 
-    /* Prefer Simple Pointer (relative movement, like a mouse); fall
-     * back to Absolute Pointer (touchpads/touchscreens, and some
-     * firmware's only pointer protocol) if that's what's available. */
+typedef struct {
+    EFI_SIMPLE_POINTER_PROTOCOL *sp[MAX_POINTERS];
+    int spDivisor[MAX_POINTERS];
+    int spCount;
+    EFI_ABSOLUTE_POINTER_PROTOCOL *ap[MAX_POINTERS];
+    int apCount;
+} PointerSet;
+
+/* Different motherboards/firmware expose pointer devices very
+ * differently: some publish EFI_SIMPLE_POINTER_PROTOCOL for a PS/2
+ * mouse instantly, some only after USB has enumerated (which can take
+ * a couple of seconds on real hardware with hubs/dongles), some only
+ * ever expose EFI_ABSOLUTE_POINTER_PROTOCOL, and a few publish more
+ * than one instance (e.g. a touchpad AND a USB mouse). Rather than
+ * grabbing whatever LocateProtocol hands back first, enumerate every
+ * handle for both protocols and poll all of them. */
+static void find_pointers(PointerSet *out) {
+    out->spCount = 0;
+    out->apCount = 0;
+
     EFI_GUID spGuid = EFI_SIMPLE_POINTER_PROTOCOL_GUID;
-    EFI_SIMPLE_POINTER_PROTOCOL *pointer = NULL;
-    BS->LocateProtocol(&spGuid, NULL, (VOID **)&pointer);
-    int pointerDivisor = 1;
-    if (pointer && pointer->Mode && pointer->Mode->ResolutionX > 1000) {
-        pointerDivisor = (int)(pointer->Mode->ResolutionX / 1000);
+    UINTN n = 0; EFI_HANDLE *h = NULL;
+    if (!EFI_ERROR(BS->LocateHandleBuffer(ByProtocol, &spGuid, NULL, &n, &h))) {
+        for (UINTN i = 0; i < n && out->spCount < MAX_POINTERS; i++) {
+            EFI_SIMPLE_POINTER_PROTOCOL *p = NULL;
+            if (!EFI_ERROR(BS->HandleProtocol(h[i], &spGuid, (VOID **)&p)) && p) {
+                out->sp[out->spCount] = p;
+                int div = 1;
+                if (p->Mode && p->Mode->ResolutionX > 1000) div = (int)(p->Mode->ResolutionX / 1000);
+                out->spDivisor[out->spCount] = div;
+                out->spCount++;
+            }
+        }
+        if (h) BS->FreePool(h);
     }
 
     EFI_GUID apGuid = EFI_ABSOLUTE_POINTER_PROTOCOL_GUID;
-    EFI_ABSOLUTE_POINTER_PROTOCOL *absPointer = NULL;
-    if (!pointer) BS->LocateProtocol(&apGuid, NULL, (VOID **)&absPointer);
+    n = 0; h = NULL;
+    if (!EFI_ERROR(BS->LocateHandleBuffer(ByProtocol, &apGuid, NULL, &n, &h))) {
+        for (UINTN i = 0; i < n && out->apCount < MAX_POINTERS; i++) {
+            EFI_ABSOLUTE_POINTER_PROTOCOL *p = NULL;
+            if (!EFI_ERROR(BS->HandleProtocol(h[i], &apGuid, (VOID **)&p)) && p) {
+                out->ap[out->apCount++] = p;
+            }
+        }
+        if (h) BS->FreePool(h);
+    }
+}
+
+static void desktop_loop(void) {
+    PointerSet ptrs;
+    ptrs.spCount = 0;
+    ptrs.apCount = 0;
+
+    /* USB enumeration can take a couple of seconds on real hardware
+     * (hubs, wireless dongles, slow devices), so keep retrying instead
+     * of giving up after a single check. */
+    for (int attempt = 0; attempt < 8; attempt++) {
+        connect_all_controllers();
+        find_pointers(&ptrs);
+        if (ptrs.spCount > 0 || ptrs.apCount > 0) break;
+        BS->Stall(250000);
+    }
 
     mouse_x = (int)screenW / 2;
     mouse_y = (int)screenH / 2;
     int left_prev = 0;
+    uint32_t rescanCounter = 0;
 
     render_frame();
 
     for (;;) {
         int left_now = left_prev;
 
-        if (pointer) {
+        /* If no pointer device was found yet, keep periodically
+         * re-checking - it may appear late (slow enumeration) or get
+         * hot-plugged while the desktop is already running. */
+        if (ptrs.spCount == 0 && ptrs.apCount == 0) {
+            rescanCounter++;
+            if (rescanCounter >= 100) { /* roughly once a second at the 10ms frame stall below */
+                rescanCounter = 0;
+                connect_all_controllers();
+                find_pointers(&ptrs);
+            }
+        }
+
+        for (int i = 0; i < ptrs.spCount; i++) {
             EFI_SIMPLE_POINTER_STATE st;
-            if (pointer->GetState(pointer, &st) == EFI_SUCCESS) {
-                int dx = st.RelativeMovementX / pointerDivisor;
-                int dy = st.RelativeMovementY / pointerDivisor;
+            if (ptrs.sp[i]->GetState(ptrs.sp[i], &st) == EFI_SUCCESS) {
+                int dx = st.RelativeMovementX / ptrs.spDivisor[i];
+                int dy = st.RelativeMovementY / ptrs.spDivisor[i];
                 if (dx > 60) dx = 60; if (dx < -60) dx = -60;
                 if (dy > 60) dy = 60; if (dy < -60) dy = -60;
                 mouse_x += dx;
                 mouse_y += dy;
-                left_now = st.LeftButton;
+                if (st.LeftButton) left_now = 1;
             }
-        } else if (absPointer) {
+        }
+        for (int i = 0; i < ptrs.apCount; i++) {
             EFI_ABSOLUTE_POINTER_STATE st;
-            if (absPointer->GetState(absPointer, &st) == EFI_SUCCESS) {
-                EFI_ABSOLUTE_POINTER_MODE *m = absPointer->Mode;
+            if (ptrs.ap[i]->GetState(ptrs.ap[i], &st) == EFI_SUCCESS) {
+                EFI_ABSOLUTE_POINTER_MODE *m = ptrs.ap[i]->Mode;
                 uint64_t rangeX = m->AbsoluteMaxX - m->AbsoluteMinX;
                 uint64_t rangeY = m->AbsoluteMaxY - m->AbsoluteMinY;
                 if (rangeX > 0) mouse_x = (int)(((st.CurrentX - m->AbsoluteMinX) * screenW) / rangeX);
                 if (rangeY > 0) mouse_y = (int)(((st.CurrentY - m->AbsoluteMinY) * screenH) / rangeY);
-                left_now = (st.ActiveButtons & EFI_ABSOLUTE_POINTER_TOUCH_ACTIVE) != 0;
+                if (st.ActiveButtons & EFI_ABSOLUTE_POINTER_TOUCH_ACTIVE) left_now = 1;
             }
         }
 

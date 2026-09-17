@@ -40,6 +40,29 @@ a USB mouse or keyboard at all once boot firmware handed off. Arrow
 keys + Enter/Space always work as a keyboard-only fallback for the whole
 desktop, in case no pointer device is found.
 
+Different boards expose pointer devices very differently — some only
+finish USB enumeration a couple of seconds after power-on, some publish
+more than one pointer instance (a touchpad and a USB mouse both), a few
+only ever expose the absolute variant. `desktop_loop()` in `boot/boot.c`
+handles this by: forcing the full driver tree to connect
+(`connect_all_controllers()`, the same thing UEFI Shell's `connect -r`
+does, since several boards only bind USB HID drivers on demand),
+enumerating *every* handle for both pointer protocols instead of taking
+whichever one `LocateProtocol` happens to hand back first, retrying that
+whole scan for a few seconds at startup, and re-scanning periodically
+while running in case a device is hot-plugged or finishes enumerating
+late.
+
+If your mouse still doesn't move after that, it's very likely a BIOS/UEFI
+setting rather than something the OS can work around: check for and
+**disable "Fast Boot"**, and make sure **"Legacy USB Support"** /
+**"USB Configuration"** is set to full/enabled rather than "boot only" or
+disabled, and that **"XHCI Hand-off"** is enabled. Several boards skip
+full USB initialization before the OS loads specifically to shave boot
+time, which keeps *any* OS (not just this one) from seeing the mouse
+until much later in a normal boot sequence. The on-screen keyboard
+fallback (arrow keys + Enter) works regardless of any of this.
+
 ## Boot menu: Live vs. Install
 
 The bootloader always shows a menu with two choices before it does
