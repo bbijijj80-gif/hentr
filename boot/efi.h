@@ -131,6 +131,78 @@ struct EFI_ABSOLUTE_POINTER_PROTOCOL {
     { 0x8d59d32b, 0xc655, 0x4ae9, {0x9b, 0x15, 0xf2, 0x59, 0x04, 0x99, 0x2a, 0x43} }
 #define EFI_ABSOLUTE_POINTER_TOUCH_ACTIVE 0x00000001
 
+/* ---- USB I/O Protocol ----
+ * A last-resort fallback: some firmware's USB stack enumerates devices
+ * (EFI_USB_IO_PROTOCOL binds to every USB device, including a mouse)
+ * but never loads a HID *class* driver on top of it, so
+ * EFI_SIMPLE_POINTER_PROTOCOL / EFI_ABSOLUTE_POINTER_PROTOCOL never
+ * appear for that mouse even though the OS's own drivers (Windows,
+ * Linux) see it fine later. When that happens we talk to the mouse's
+ * USB HID Boot Protocol interface directly: find its interrupt-IN
+ * endpoint and read raw 3-byte boot mouse reports ourselves. */
+typedef struct {
+    uint8_t Length, DescriptorType;
+    uint16_t BcdUSB;
+    uint8_t DeviceClass, DeviceSubClass, DeviceProtocol, MaxPacketSize0;
+    uint16_t IdVendor, IdProduct, BcdDevice;
+    uint8_t StrManufacturer, StrProduct, StrSerialNumber, NumConfigurations;
+} EFI_USB_DEVICE_DESCRIPTOR;
+
+typedef struct {
+    uint8_t Length, DescriptorType, InterfaceNumber, AlternateSetting, NumEndpoints;
+    uint8_t InterfaceClass, InterfaceSubClass, InterfaceProtocol, Interface;
+} EFI_USB_INTERFACE_DESCRIPTOR;
+
+typedef struct {
+    uint8_t Length, DescriptorType, EndpointAddress, Attributes;
+    uint16_t MaxPacketSize;
+    uint8_t Interval;
+} EFI_USB_ENDPOINT_DESCRIPTOR;
+
+typedef struct {
+    uint8_t RequestType, Request;
+    uint16_t Value, Index, Length;
+} EFI_USB_DEVICE_REQUEST;
+
+typedef enum { EfiUsbDataIn, EfiUsbDataOut, EfiUsbNoData } EFI_USB_DATA_DIRECTION;
+
+typedef struct EFI_USB_IO_PROTOCOL EFI_USB_IO_PROTOCOL;
+typedef EFI_STATUS (EFIAPI *EFI_USB_IO_CONTROL_TRANSFER)(EFI_USB_IO_PROTOCOL *This, EFI_USB_DEVICE_REQUEST *Request, EFI_USB_DATA_DIRECTION Direction, uint32_t Timeout, VOID *Data, UINTN DataLength, uint32_t *Status);
+typedef EFI_STATUS (EFIAPI *EFI_USB_IO_BULK_TRANSFER)(EFI_USB_IO_PROTOCOL *This, uint8_t DeviceEndpoint, VOID *Data, UINTN *DataLength, UINTN Timeout, uint32_t *Status);
+typedef EFI_STATUS (EFIAPI *EFI_ASYNC_USB_TRANSFER_CALLBACK)(VOID *Data, UINTN DataLength, VOID *Context, uint32_t Status);
+typedef EFI_STATUS (EFIAPI *EFI_USB_IO_ASYNC_INTERRUPT_TRANSFER)(EFI_USB_IO_PROTOCOL *This, uint8_t DeviceEndpoint, BOOLEAN IsNewTransfer, UINTN PollingInterval, UINTN DataLength, EFI_ASYNC_USB_TRANSFER_CALLBACK InterruptCallback, VOID *Context);
+typedef EFI_STATUS (EFIAPI *EFI_USB_IO_SYNC_INTERRUPT_TRANSFER)(EFI_USB_IO_PROTOCOL *This, uint8_t DeviceEndpoint, VOID *Data, UINTN *DataLength, UINTN Timeout, uint32_t *Status);
+typedef EFI_STATUS (EFIAPI *EFI_USB_IO_GET_DEVICE_DESCRIPTOR)(EFI_USB_IO_PROTOCOL *This, EFI_USB_DEVICE_DESCRIPTOR *DeviceDescriptor);
+typedef EFI_STATUS (EFIAPI *EFI_USB_IO_GET_CONFIG_DESCRIPTOR)(EFI_USB_IO_PROTOCOL *This, VOID *ConfigurationDescriptor);
+typedef EFI_STATUS (EFIAPI *EFI_USB_IO_GET_INTERFACE_DESCRIPTOR)(EFI_USB_IO_PROTOCOL *This, EFI_USB_INTERFACE_DESCRIPTOR *InterfaceDescriptor);
+typedef EFI_STATUS (EFIAPI *EFI_USB_IO_GET_ENDPOINT_DESCRIPTOR)(EFI_USB_IO_PROTOCOL *This, uint8_t EndpointIndex, EFI_USB_ENDPOINT_DESCRIPTOR *EndpointDescriptor);
+
+struct EFI_USB_IO_PROTOCOL {
+    EFI_USB_IO_CONTROL_TRANSFER UsbControlTransfer;
+    EFI_USB_IO_BULK_TRANSFER UsbBulkTransfer;
+    EFI_USB_IO_ASYNC_INTERRUPT_TRANSFER UsbAsyncInterruptTransfer;
+    EFI_USB_IO_SYNC_INTERRUPT_TRANSFER UsbSyncInterruptTransfer;
+    void *UsbIsochronousTransfer;
+    void *UsbAsyncIsochronousTransfer;
+    EFI_USB_IO_GET_DEVICE_DESCRIPTOR UsbGetDeviceDescriptor;
+    EFI_USB_IO_GET_CONFIG_DESCRIPTOR UsbGetConfigDescriptor;
+    EFI_USB_IO_GET_INTERFACE_DESCRIPTOR UsbGetInterfaceDescriptor;
+    EFI_USB_IO_GET_ENDPOINT_DESCRIPTOR UsbGetEndpointDescriptor;
+    void *UsbGetStringDescriptor;
+    void *UsbGetSupportedLanguages;
+    void *UsbPortReset;
+};
+
+#define EFI_USB_IO_PROTOCOL_GUID \
+    { 0x2B2F68D6, 0x0CD2, 0x44cf, {0x8E, 0x8B, 0xBB, 0xA2, 0x0B, 0x1B, 0x5B, 0x75} }
+
+#define USB_ENDPOINT_DIR_IN   0x80
+#define USB_ENDPOINT_TYPE_MASK 0x03
+#define USB_ENDPOINT_TYPE_INTERRUPT 0x03
+#define USB_HID_CLASS 0x03
+#define USB_HID_SUBCLASS_BOOT 0x01
+#define USB_HID_PROTOCOL_MOUSE 0x02
+
 /* ---- Boot services table (only the entries we use) ---- */
 typedef enum { AllocateAnyPages, AllocateMaxAddress, AllocateAddress, MaxAllocateType } EFI_ALLOCATE_TYPE;
 typedef enum { EfiLoaderData = 2, EfiBootServicesData = 4 } EFI_MEMORY_TYPE;

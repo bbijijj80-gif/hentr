@@ -409,12 +409,52 @@ static void connect_all_controllers(void) {
 #define MAX_POINTERS 8
 
 typedef struct {
+    EFI_USB_IO_PROTOCOL *io;
+    uint8_t ep;
+} RawHidMouse;
+
+typedef struct {
     EFI_SIMPLE_POINTER_PROTOCOL *sp[MAX_POINTERS];
     int spDivisor[MAX_POINTERS];
     int spCount;
     EFI_ABSOLUTE_POINTER_PROTOCOL *ap[MAX_POINTERS];
     int apCount;
+    RawHidMouse raw[MAX_POINTERS];
+    int rawCount;
 } PointerSet;
+
+/* Last-resort fallback: some firmware's USB stack enumerates a mouse
+ * (EFI_USB_IO_PROTOCOL binds to it) but never loads a HID class driver
+ * on top, so neither pointer protocol above ever appears for it - even
+ * though the OS's own drivers (Windows, Linux) see the same mouse just
+ * fine once they take over. When that happens, talk to the mouse's USB
+ * HID Boot Protocol interface directly: find its interrupt-IN endpoint
+ * and read raw 3-byte boot mouse reports (buttons, dx, dy) ourselves. */
+static void find_raw_hid_mice(PointerSet *out) {
+    out->rawCount = 0;
+    EFI_GUID usbIoGuid = EFI_USB_IO_PROTOCOL_GUID;
+    UINTN n = 0; EFI_HANDLE *h = NULL;
+    if (EFI_ERROR(BS->LocateHandleBuffer(ByProtocol, &usbIoGuid, NULL, &n, &h))) return;
+    for (UINTN i = 0; i < n && out->rawCount < MAX_POINTERS; i++) {
+        EFI_USB_IO_PROTOCOL *io = NULL;
+        if (EFI_ERROR(BS->HandleProtocol(h[i], &usbIoGuid, (VOID **)&io)) || !io) continue;
+        EFI_USB_INTERFACE_DESCRIPTOR iface;
+        if (!io->UsbGetInterfaceDescriptor || EFI_ERROR(io->UsbGetInterfaceDescriptor(io, &iface))) continue;
+        if (iface.InterfaceClass != USB_HID_CLASS || iface.InterfaceProtocol != USB_HID_PROTOCOL_MOUSE) continue;
+        for (uint8_t e = 0; e < iface.NumEndpoints; e++) {
+            EFI_USB_ENDPOINT_DESCRIPTOR ep;
+            if (!io->UsbGetEndpointDescriptor || EFI_ERROR(io->UsbGetEndpointDescriptor(io, e, &ep))) continue;
+            if ((ep.Attributes & USB_ENDPOINT_TYPE_MASK) == USB_ENDPOINT_TYPE_INTERRUPT &&
+                (ep.EndpointAddress & USB_ENDPOINT_DIR_IN)) {
+                out->raw[out->rawCount].io = io;
+                out->raw[out->rawCount].ep = ep.EndpointAddress;
+                out->rawCount++;
+                break;
+            }
+        }
+    }
+    if (h) BS->FreePool(h);
+}
 
 /* Different motherboards/firmware expose pointer devices very
  * differently: some publish EFI_SIMPLE_POINTER_PROTOCOL for a PS/2
@@ -423,10 +463,12 @@ typedef struct {
  * ever expose EFI_ABSOLUTE_POINTER_PROTOCOL, and a few publish more
  * than one instance (e.g. a touchpad AND a USB mouse). Rather than
  * grabbing whatever LocateProtocol hands back first, enumerate every
- * handle for both protocols and poll all of them. */
+ * handle for both protocols and poll all of them. If neither is found
+ * at all, fall back to driving the raw USB HID interface ourselves. */
 static void find_pointers(PointerSet *out) {
     out->spCount = 0;
     out->apCount = 0;
+    out->rawCount = 0;
 
     EFI_GUID spGuid = EFI_SIMPLE_POINTER_PROTOCOL_GUID;
     UINTN n = 0; EFI_HANDLE *h = NULL;
@@ -455,6 +497,10 @@ static void find_pointers(PointerSet *out) {
         }
         if (h) BS->FreePool(h);
     }
+
+    if (out->spCount == 0 && out->apCount == 0) {
+        find_raw_hid_mice(out);
+    }
 }
 
 static void desktop_loop(void) {
@@ -468,7 +514,7 @@ static void desktop_loop(void) {
     for (int attempt = 0; attempt < 8; attempt++) {
         connect_all_controllers();
         find_pointers(&ptrs);
-        g_pointerCount = ptrs.spCount + ptrs.apCount;
+        g_pointerCount = ptrs.spCount + ptrs.apCount + ptrs.rawCount;
         if (ptrs.spCount > 0 || ptrs.apCount > 0) break;
         BS->Stall(250000);
     }
@@ -501,7 +547,7 @@ static void desktop_loop(void) {
                 rescanCounter = 0;
                 connect_all_controllers();
                 find_pointers(&ptrs);
-                g_pointerCount = ptrs.spCount + ptrs.apCount;
+                g_pointerCount = ptrs.spCount + ptrs.apCount + ptrs.rawCount;
             }
         }
 
@@ -526,6 +572,21 @@ static void desktop_loop(void) {
                 if (rangeX > 0) mouse_x = (int)(((st.CurrentX - m->AbsoluteMinX) * screenW) / rangeX);
                 if (rangeY > 0) mouse_y = (int)(((st.CurrentY - m->AbsoluteMinY) * screenH) / rangeY);
                 if (st.ActiveButtons & EFI_ABSOLUTE_POINTER_TOUCH_ACTIVE) left_now = 1;
+            }
+        }
+        for (int i = 0; i < ptrs.rawCount; i++) {
+            uint8_t buf[8];
+            UINTN len = 4;
+            uint32_t xferStatus = 0;
+            EFI_USB_IO_PROTOCOL *io = ptrs.raw[i].io;
+            if (io->UsbSyncInterruptTransfer(io, ptrs.raw[i].ep, buf, &len, 1, &xferStatus) == EFI_SUCCESS && len >= 3) {
+                int dx = (int8_t)buf[1];
+                int dy = (int8_t)buf[2];
+                if (dx > 60) dx = 60; if (dx < -60) dx = -60;
+                if (dy > 60) dy = 60; if (dy < -60) dy = -60;
+                mouse_x += dx;
+                mouse_y += dy;
+                if (buf[0] & 0x01) left_now = 1;
             }
         }
 
