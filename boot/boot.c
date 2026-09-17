@@ -140,11 +140,12 @@ static void wait_for_any_key(void) {
     }
 }
 
-/* selected: 0 for option 1, 1 for option 2 (-1 draws neither highlighted,
- * used before any key has been read yet). */
-static void draw_menu(int selected) {
+/* selected: 0 for option 1, 1 for option 2. phase1000 drives the logo's
+ * dissolve/reassemble animation: 0 = scattered into a cloud of dots,
+ * 1000 = fully assembled. */
+static void draw_menu(int selected, const LogoPoint *logoPts, int logoPtCount, int phase1000) {
     fill_rect(0, 0, screenW, screenH, COL_BG);
-    draw_hentros_logo((int)screenW / 2, (int)screenH / 3, 6, COL_YELLOW);
+    draw_logo_particles(logoPts, logoPtCount, (int)screenW / 2, (int)screenH / 3, phase1000, COL_YELLOW);
 
     int y = (int)screenH * 2 / 3;
     center_string(y, "HENTROS", COL_TEXT, 4);
@@ -164,12 +165,25 @@ static void draw_menu(int selected) {
     present();
 }
 
+/* Triangle wave 0 -> 1000 -> 0 over `period` frames: the logo
+ * assembles, holds briefly, then dissolves back into dots and repeats -
+ * the same "the mark is made of many small points, coming together"
+ * motion as Claude's own loading animation. */
+static int triangle_wave1000(uint32_t frame, uint32_t period) {
+    uint32_t t = frame % period;
+    if (t < period / 2) return (int)(t * 1000 / (period / 2));
+    return (int)(1000 - (t - period / 2) * 1000 / (period / 2));
+}
+
 /* Accepts either a direct digit press or arrow-key navigation confirmed
  * with Enter/Space, since keyboards and firmware vary enough that one
  * single input method isn't reliably enough on every board. */
 static char wait_for_choice(void) {
     int selected = 0;
-    draw_menu(selected);
+    static LogoPoint logoPts[1300];
+    int logoPtCount = build_hentros_logo_points((int)screenW / 2, (int)screenH / 3, 6, logoPts, 1300);
+
+    uint32_t frame = 0;
     for (;;) {
         EFI_INPUT_KEY key;
         if (ST->ConIn->ReadKeyStroke(ST->ConIn, &key) == EFI_SUCCESS) {
@@ -179,9 +193,11 @@ static char wait_for_choice(void) {
             if (key.ScanCode == 1 || key.ScanCode == 4) selected = 0; /* up/left */
             if (key.ScanCode == 2 || key.ScanCode == 3) selected = 1; /* down/right */
             if (key.UnicodeChar == 13 || key.UnicodeChar == ' ') return selected == 0 ? '1' : '2';
-            draw_menu(selected); /* live-updates the diagnostics line on every keystroke */
         }
-        BS->Stall(20000);
+        int phase = triangle_wave1000(frame, 180);
+        draw_menu(selected, logoPts, logoPtCount, phase);
+        frame++;
+        BS->Stall(16000); /* ~60 fps-ish frame pacing */
     }
 }
 
