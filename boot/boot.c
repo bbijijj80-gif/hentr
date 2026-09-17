@@ -1,9 +1,18 @@
-/* hentrOS bootloader: finds the GOP framebuffer, shows a boot menu (Live
- * from RAM, or Install a copy to a disk), loads KERNEL.BIN from the ESP,
- * exits boot services, and jumps into the kernel. */
+/* hentrOS: a single UEFI application. It shows a boot menu (Live from
+ * RAM, or Install a copy to a disk), then either way runs the whole
+ * desktop itself without ever calling ExitBootServices.
+ *
+ * Staying inside Boot/Runtime Services the whole time is deliberate:
+ * it means mouse, keyboard and the clock all go through UEFI's own
+ * protocols (EFI_SIMPLE_POINTER_PROTOCOL, EFI_SIMPLE_TEXT_INPUT_PROTOCOL,
+ * EFI_RUNTIME_SERVICES.GetTime) instead of us hand-rolling a PS/2 or
+ * CMOS driver. UEFI's own driver stack already understands USB HID, so
+ * this is what makes the mouse and keyboard work on real, USB-only
+ * hardware - polling raw PS/2 ports directly does not. */
 #include "efi.h"
 #include "bootinfo.h"
 #include "../kernel/gfx.h"
+#include "../kernel/font.h"
 #include "../kernel/logo.h"
 
 static EFI_SYSTEM_TABLE *ST;
@@ -13,8 +22,6 @@ static void puts_(CHAR16 *s) {
     ST->ConOut->OutputString(ST->ConOut, s);
 }
 
-typedef void (__attribute__((sysv_abi)) *KernelEntry)(BootInfo *info);
-
 #define COL_BG      0x101010
 #define COL_YELLOW  0xF6D51A
 #define COL_TEXT    0xE8E8E8
@@ -22,19 +29,39 @@ typedef void (__attribute__((sysv_abi)) *KernelEntry)(BootInfo *info);
 #define COL_OK      0x40C060
 #define COL_ERR     0xE05050
 
+#define COL_DESKTOP_TOP    0x2F6FB0
+#define COL_DESKTOP_BOTTOM 0x0B3A66
+#define COL_TASKBAR        0x1B2733
+#define COL_TASKBAR_EDGE   0x3A4A5C
+#define COL_START_BTN      0x2E8B57
+#define COL_START_BTN_HI   0x3DAF71
+#define COL_WINDOW_BODY    0xECECEC
+#define COL_TITLEBAR_TOP   0x3E7FCB
+#define COL_TITLEBAR_BOT   0x1F4E96
+#define COL_CLOSE_BTN      0xE03030
+#define COL_TEXT_LIGHT     0xFFFFFF
+#define COL_TEXT_DARK      0x222222
+#define COL_BORDER         0x0A1A2E
+#define COL_MENU_BG        0x263447
+#define COL_MENU_HI        0x35516E
+
 static uint32_t screenW, screenH;
+static uint32_t *realFb;
+static uint32_t realStride;
+
+static void present(void) { gfx_present(realFb, realStride); }
 
 static void center_string(int y, const char *s, uint32_t color, int scale) {
     int w = text_width(s, scale);
     draw_string(((int)screenW - w) / 2, y, s, color, scale);
 }
 
-/* Blocks until '1' or '2' is pressed; any other key is ignored. */
+/* ============================== Boot menu ============================== */
+
 static char wait_for_choice(void) {
     for (;;) {
         EFI_INPUT_KEY key;
-        EFI_STATUS st = ST->ConIn->ReadKeyStroke(ST->ConIn, &key);
-        if (st == EFI_SUCCESS) {
+        if (ST->ConIn->ReadKeyStroke(ST->ConIn, &key) == EFI_SUCCESS) {
             if (key.UnicodeChar == '1' || key.UnicodeChar == '2') return (char)key.UnicodeChar;
         }
         BS->Stall(20000);
@@ -61,46 +88,18 @@ static void draw_menu(void) {
     center_string(y, "[2] INSTALL - COPY HENTROS TO A DISK, KEEPS YOUR OTHER OS", COL_TEXT, 1);
     y += 30;
     center_string(y, "PRESS 1 OR 2", COL_HINT, 1);
+    present();
 }
 
 static void status_line(int row, const char *s, uint32_t color) {
     int y = (int)screenH * 2 / 3 + 90 + row * 18;
     fill_rect(0, y, screenW, 18, COL_BG);
     center_string(y, s, color, 1);
+    present();
 }
 
-/* Loads \KERNEL.BIN from the given filesystem root into freshly
- * allocated pages at a fixed load address. Returns the loaded address
- * and size via out-params, or a non-success status on failure. */
-static EFI_STATUS load_kernel(EFI_FILE_PROTOCOL *root, EFI_PHYSICAL_ADDRESS *outAddr, UINTN *outSize) {
-    EFI_FILE_PROTOCOL *kernelFile = NULL;
-    EFI_STATUS status = root->Open(root, &kernelFile, L"\\KERNEL.BIN", EFI_FILE_MODE_READ, 0);
-    if (EFI_ERROR(status)) return status;
+/* ============================== Installer =============================== */
 
-    EFI_GUID fiGuid = EFI_FILE_INFO_GUID;
-    UINTN infoSize = sizeof(EFI_FILE_INFO) + 16;
-    EFI_FILE_INFO *fileInfo = NULL;
-    BS->AllocatePool(EfiLoaderData, infoSize, (VOID **)&fileInfo);
-    kernelFile->GetInfo(kernelFile, &fiGuid, &infoSize, fileInfo);
-    UINTN kernelSize = (UINTN)fileInfo->FileSize;
-    BS->FreePool(fileInfo);
-
-    UINTN pages = (kernelSize + 4095) / 4096;
-    EFI_PHYSICAL_ADDRESS kernelAddr = 0x200000; /* load kernel at 2 MiB */
-    status = BS->AllocatePages(AllocateAddress, EfiLoaderData, pages, &kernelAddr);
-    if (EFI_ERROR(status)) { kernelFile->Close(kernelFile); return status; }
-
-    status = kernelFile->Read(kernelFile, &kernelSize, (VOID *)kernelAddr);
-    kernelFile->Close(kernelFile);
-    if (EFI_ERROR(status)) return status;
-
-    *outAddr = kernelAddr;
-    *outSize = kernelSize;
-    return EFI_SUCCESS;
-}
-
-/* Creates (or opens, if it already exists) a subdirectory without
- * touching anything else already on the volume. */
 static EFI_STATUS open_or_create_dir(EFI_FILE_PROTOCOL *parent, CHAR16 *name, EFI_FILE_PROTOCOL **out) {
     return parent->Open(parent, out, name,
                          EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE,
@@ -118,12 +117,10 @@ static EFI_STATUS write_whole_file(EFI_FILE_PROTOCOL *dir, CHAR16 *name, VOID *d
     return status;
 }
 
-/* Copies this running bootloader image plus the already-loaded kernel
- * onto the first other disk volume it can find, under \EFI\HENTROS\ -
- * never touching \EFI\BOOT\ or any file that belongs to whatever OS is
- * already installed there. */
-static void do_install(EFI_HANDLE ImageHandle, EFI_LOADED_IMAGE_PROTOCOL *loadedImage,
-                        VOID *kernelData, UINTN kernelSize) {
+/* Copies this running image onto the first other disk volume it can
+ * find, under \EFI\HENTROS\ - never touching \EFI\BOOT\ or any file
+ * that belongs to whatever OS is already installed there. */
+static void do_install(EFI_LOADED_IMAGE_PROTOCOL *loadedImage) {
     EFI_GUID fsGuid = EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID;
     UINTN count = 0;
     EFI_HANDLE *handles = NULL;
@@ -139,7 +136,7 @@ static void do_install(EFI_HANDLE ImageHandle, EFI_LOADED_IMAGE_PROTOCOL *loaded
     for (UINTN i = 0; i < count; i++) {
         if (handles[i] != loadedImage->DeviceHandle) { target = handles[i]; break; }
     }
-    if (!target && count > 0) target = handles[0]; /* fall back to the boot volume itself */
+    if (!target && count > 0) target = handles[0];
     BS->FreePool(handles);
 
     if (!target) {
@@ -171,8 +168,6 @@ static void do_install(EFI_HANDLE ImageHandle, EFI_LOADED_IMAGE_PROTOCOL *loaded
     }
 
     status = write_whole_file(hentrosDir, L"BOOTX64.EFI", loadedImage->ImageBase, loadedImage->ImageSize);
-    if (!EFI_ERROR(status))
-        status = write_whole_file(hentrosDir, L"KERNEL.BIN", kernelData, kernelSize);
 
     if (hentrosDir) hentrosDir->Close(hentrosDir);
     if (efiDir) efiDir->Close(efiDir);
@@ -191,16 +186,267 @@ static void do_install(EFI_HANDLE ImageHandle, EFI_LOADED_IMAGE_PROTOCOL *loaded
     status_line(2, "USE YOUR FIRMWARE'S BOOT MENU (E.G. F12 / ESC) TO", COL_HINT);
     status_line(3, "PICK IT LATER. PRESS ANY KEY TO TRY IT NOW.", COL_HINT);
     wait_for_any_key();
-    (void)ImageHandle;
 }
+
+/* ============================== Desktop =============================== */
+
+typedef struct { int x, y, w, h, visible; } Window;
+
+static Window win = { .x = 220, .y = 120, .w = 420, .h = 260, .visible = 1 };
+static int start_menu_open = 0;
+static int dragging = 0;
+static int drag_off_x, drag_off_y;
+static int mouse_x, mouse_y;
+static int taskbarH = 40;
+
+static int rect_hit(int px, int py, int x, int y, int w, int h) {
+    return px >= x && px < x + w && py >= y && py < y + h;
+}
+
+static void draw_taskbar(void) {
+    int ty = (int)screenH - taskbarH;
+    fill_rect(0, ty, screenW, taskbarH, COL_TASKBAR);
+    draw_hline(0, ty, screenW, COL_TASKBAR_EDGE);
+
+    uint32_t sbtn = start_menu_open ? COL_START_BTN_HI : COL_START_BTN;
+    fill_rect(8, ty + 6, 90, taskbarH - 12, sbtn);
+    draw_string(8 + 14, ty + 6 + (taskbarH - 12 - FONT_H) / 2, "START", COL_TEXT_LIGHT, 1);
+
+    if (win.visible) {
+        fill_rect(110, ty + 6, 150, taskbarH - 12, COL_MENU_HI);
+        draw_string(110 + 8, ty + 6 + (taskbarH - 12 - FONT_H) / 2, "HENTROS", COL_TEXT_LIGHT, 1);
+    }
+
+    EFI_TIME t;
+    char buf[9] = "--:--:--";
+    if (ST->RuntimeServices && ST->RuntimeServices->GetTime &&
+        ST->RuntimeServices->GetTime(&t, NULL) == EFI_SUCCESS) {
+        buf[0] = '0' + t.Hour / 10;   buf[1] = '0' + t.Hour % 10;
+        buf[3] = '0' + t.Minute / 10; buf[4] = '0' + t.Minute % 10;
+        buf[6] = '0' + t.Second / 10; buf[7] = '0' + t.Second % 10;
+    }
+    int tw = text_width(buf, 1);
+    draw_string((int)screenW - tw - 14, ty + (taskbarH - FONT_H) / 2, buf, COL_TEXT_LIGHT, 1);
+}
+
+static void draw_start_menu(void) {
+    int mw = 220, mh = 190;
+    int mx = 8, my = (int)screenH - taskbarH - mh;
+    fill_rect(mx, my, mw, mh, COL_MENU_BG);
+    draw_rect(mx, my, mw, mh, COL_TASKBAR_EDGE);
+    draw_string(mx + 12, my + 12, "HENTROS MENU", COL_TEXT_LIGHT, 1);
+    draw_hline(mx + 8, my + 28, mw - 16, COL_TASKBAR_EDGE);
+
+    const char *items[] = { "SHOW WINDOW", "ABOUT", "REBOOT" };
+    for (int i = 0; i < 3; i++) {
+        int iy = my + 40 + i * 30;
+        if (rect_hit(mouse_x, mouse_y, mx + 6, iy, mw - 12, 26))
+            fill_rect(mx + 6, iy, mw - 12, 26, COL_MENU_HI);
+        draw_string(mx + 16, iy + 9, items[i], COL_TEXT_LIGHT, 1);
+    }
+}
+
+static void draw_window(void) {
+    if (!win.visible) return;
+    int titleH = 28;
+    fill_gradient_v(win.x, win.y, win.w, titleH, COL_TITLEBAR_TOP, COL_TITLEBAR_BOT);
+    draw_string(win.x + 10, win.y + (titleH - FONT_H) / 2, "WELCOME TO HENTROS", COL_TEXT_LIGHT, 1);
+
+    int cbx = win.x + win.w - 24, cby = win.y + 5, cbs = 18;
+    fill_rect(cbx, cby, cbs, cbs, COL_CLOSE_BTN);
+    draw_string(cbx + 5, cby + 5, "X", COL_TEXT_LIGHT, 1);
+
+    fill_rect(win.x, win.y + titleH, win.w, win.h - titleH, COL_WINDOW_BODY);
+    draw_rect(win.x, win.y, win.w, win.h, COL_BORDER);
+    draw_hline(win.x, win.y + titleH, win.w, COL_BORDER);
+
+    draw_string(win.x + 16, win.y + titleH + 20, "A TOY HOBBY OPERATING SYSTEM DEMO.", COL_TEXT_DARK, 1);
+    draw_string(win.x + 16, win.y + titleH + 40, "BUILT WITH A UEFI BOOTLOADER AND A", COL_TEXT_DARK, 1);
+    draw_string(win.x + 16, win.y + titleH + 60, "FRAMEBUFFER BASED GRAPHICAL SHELL.", COL_TEXT_DARK, 1);
+    draw_string(win.x + 16, win.y + titleH + 90, "DRAG THIS TITLE BAR TO MOVE ME.", COL_TEXT_DARK, 1);
+}
+
+static void draw_desktop_icons(void) {
+    fill_rect(30, 30, 48, 40, 0xD8E4F0);
+    draw_rect(30, 30, 48, 40, COL_BORDER);
+    fill_rect(38, 38, 32, 20, 0x1B2733);
+    draw_string(18, 76, "MY COMPUTER", COL_TEXT_LIGHT, 1);
+
+    draw_hentros_logo((int)screenW - 90, 90, 2, 0xF6D51A);
+    draw_string((int)screenW - 130, 140, "HENTROS", COL_TEXT_LIGHT, 1);
+}
+
+#define CUR_SZ 16
+static void draw_cursor(int x, int y) {
+    static const char *shape[CUR_SZ] = {
+        "#...............", "##..............", "#.#.............", "#..#............",
+        "#...#...........", "#....#..........", "#.....#.........", "#......#........",
+        "#.......#.......", "#....#####......", "#..##...........", "#.#.............",
+        "##..............", "#...............", "................", "................",
+    };
+    for (int j = 0; j < CUR_SZ; j++)
+        for (int i = 0; i < CUR_SZ; i++)
+            if (shape[j][i] == '#') {
+                put_pixel(x + i, y + j, 0x000000);
+                put_pixel(x + i + 1, y + j, 0xFFFFFF);
+            }
+}
+
+/* Everything is redrawn into the off-screen buffer every frame, then
+ * blitted to the real framebuffer in one shot by present() - simpler
+ * and tear-free compared to patching only the changed regions of a
+ * live-scanned-out framebuffer. */
+static void render_frame(void) {
+    fill_gradient_v(0, 0, screenW, screenH - taskbarH, COL_DESKTOP_TOP, COL_DESKTOP_BOTTOM);
+    draw_desktop_icons();
+    draw_window();
+    draw_taskbar();
+    if (start_menu_open) draw_start_menu();
+    draw_cursor(mouse_x, mouse_y);
+    present();
+}
+
+/* Some firmware only binds USB HID drivers (mouse/keyboard) lazily, on
+ * demand, rather than eagerly at boot. Force the whole driver tree to
+ * connect - the same thing the UEFI Shell's "connect -r" does - so a
+ * USB mouse's pointer protocol actually shows up before we go looking
+ * for it. */
+static void connect_all_controllers(void) {
+    UINTN count = 0;
+    EFI_HANDLE *handles = NULL;
+    if (EFI_ERROR(BS->LocateHandleBuffer(AllHandles, NULL, NULL, &count, &handles))) return;
+    for (UINTN i = 0; i < count; i++) {
+        BS->ConnectController(handles[i], NULL, NULL, TRUE);
+    }
+    BS->FreePool(handles);
+}
+
+static void desktop_loop(void) {
+    connect_all_controllers();
+
+    /* Prefer Simple Pointer (relative movement, like a mouse); fall
+     * back to Absolute Pointer (touchpads/touchscreens, and some
+     * firmware's only pointer protocol) if that's what's available. */
+    EFI_GUID spGuid = EFI_SIMPLE_POINTER_PROTOCOL_GUID;
+    EFI_SIMPLE_POINTER_PROTOCOL *pointer = NULL;
+    BS->LocateProtocol(&spGuid, NULL, (VOID **)&pointer);
+    int pointerDivisor = 1;
+    if (pointer && pointer->Mode && pointer->Mode->ResolutionX > 1000) {
+        pointerDivisor = (int)(pointer->Mode->ResolutionX / 1000);
+    }
+
+    EFI_GUID apGuid = EFI_ABSOLUTE_POINTER_PROTOCOL_GUID;
+    EFI_ABSOLUTE_POINTER_PROTOCOL *absPointer = NULL;
+    if (!pointer) BS->LocateProtocol(&apGuid, NULL, (VOID **)&absPointer);
+
+    mouse_x = (int)screenW / 2;
+    mouse_y = (int)screenH / 2;
+    int left_prev = 0;
+
+    render_frame();
+
+    for (;;) {
+        int left_now = left_prev;
+
+        if (pointer) {
+            EFI_SIMPLE_POINTER_STATE st;
+            if (pointer->GetState(pointer, &st) == EFI_SUCCESS) {
+                int dx = st.RelativeMovementX / pointerDivisor;
+                int dy = st.RelativeMovementY / pointerDivisor;
+                if (dx > 60) dx = 60; if (dx < -60) dx = -60;
+                if (dy > 60) dy = 60; if (dy < -60) dy = -60;
+                mouse_x += dx;
+                mouse_y += dy;
+                left_now = st.LeftButton;
+            }
+        } else if (absPointer) {
+            EFI_ABSOLUTE_POINTER_STATE st;
+            if (absPointer->GetState(absPointer, &st) == EFI_SUCCESS) {
+                EFI_ABSOLUTE_POINTER_MODE *m = absPointer->Mode;
+                uint64_t rangeX = m->AbsoluteMaxX - m->AbsoluteMinX;
+                uint64_t rangeY = m->AbsoluteMaxY - m->AbsoluteMinY;
+                if (rangeX > 0) mouse_x = (int)(((st.CurrentX - m->AbsoluteMinX) * screenW) / rangeX);
+                if (rangeY > 0) mouse_y = (int)(((st.CurrentY - m->AbsoluteMinY) * screenH) / rangeY);
+                left_now = (st.ActiveButtons & EFI_ABSOLUTE_POINTER_TOUCH_ACTIVE) != 0;
+            }
+        }
+
+        /* Keyboard is always available (arrow keys move the cursor,
+         * Enter clicks) so the desktop stays usable even without a
+         * working pointer device. */
+        EFI_INPUT_KEY key;
+        while (ST->ConIn->ReadKeyStroke(ST->ConIn, &key) == EFI_SUCCESS) {
+            switch (key.ScanCode) {
+                case 1: mouse_y -= 10; break; /* up */
+                case 2: mouse_y += 10; break; /* down */
+                case 3: mouse_x += 10; break; /* right */
+                case 4: mouse_x -= 10; break; /* left */
+            }
+            if (key.UnicodeChar == 13 || key.UnicodeChar == ' ') left_now = 1;
+        }
+
+        if (mouse_x < 0) mouse_x = 0;
+        if (mouse_y < 0) mouse_y = 0;
+        if ((uint32_t)mouse_x > screenW - 2) mouse_x = screenW - 2;
+        if ((uint32_t)mouse_y > screenH - 2) mouse_y = screenH - 2;
+
+        int left_click = left_now && !left_prev;
+        int left_release = !left_now && left_prev;
+
+        if (left_click) {
+            int ty = (int)screenH - taskbarH;
+            if (rect_hit(mouse_x, mouse_y, 8, ty + 6, 90, taskbarH - 12)) {
+                start_menu_open = !start_menu_open;
+            } else if (start_menu_open) {
+                int mw = 220, mh = 190, mx = 8, my = (int)screenH - taskbarH - mh;
+                if (rect_hit(mouse_x, mouse_y, mx, my, mw, mh)) {
+                    for (int i = 0; i < 3; i++) {
+                        int iy = my + 40 + i * 30;
+                        if (rect_hit(mouse_x, mouse_y, mx + 6, iy, mw - 12, 26)) {
+                            if (i == 0) win.visible = 1;
+                            start_menu_open = 0;
+                        }
+                    }
+                } else {
+                    start_menu_open = 0;
+                }
+            } else if (win.visible) {
+                int cbx = win.x + win.w - 24, cby = win.y + 5, cbs = 18;
+                if (rect_hit(mouse_x, mouse_y, cbx, cby, cbs, cbs)) {
+                    win.visible = 0;
+                } else if (rect_hit(mouse_x, mouse_y, win.x, win.y, win.w, 28)) {
+                    dragging = 1;
+                    drag_off_x = mouse_x - win.x;
+                    drag_off_y = mouse_y - win.y;
+                }
+            }
+        }
+        if (left_release) dragging = 0;
+
+        if (dragging && left_now) {
+            win.x = mouse_x - drag_off_x;
+            win.y = mouse_y - drag_off_y;
+            if (win.x < 0) win.x = 0;
+            if (win.y < 0) win.y = 0;
+            if (win.x + win.w > (int)screenW) win.x = (int)screenW - win.w;
+            if (win.y + win.h > (int)screenH - taskbarH) win.y = (int)screenH - taskbarH - win.h;
+        }
+
+        left_prev = left_now;
+
+        render_frame();
+        BS->Stall(10000); /* ~100 fps cap; keeps this from pegging a CPU core */
+    }
+}
+
+/* ============================== Entry point ============================= */
 
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     ST = SystemTable;
     BS = ST->BootServices;
 
-    puts_(L"hentrOS bootloader starting...\r\n");
+    puts_(L"hentrOS starting...\r\n");
 
-    /* --- Graphics Output Protocol --- */
     EFI_GUID gopGuid = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;
     EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = NULL;
     EFI_STATUS status = BS->LocateProtocol(&gopGuid, NULL, (VOID **)&gop);
@@ -209,8 +455,6 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         return status;
     }
 
-    /* Pick the highest-resolution 32bpp mode that is still comfortable to
-     * push from a CPU-driven, unaccelerated software renderer. */
     #define MAX_PIXELS (1920u * 1200u)
     uint32_t bestMode = gop->Mode->Mode;
     uint32_t bestPixels = gop->Mode->Info->HorizontalResolution * gop->Mode->Info->VerticalResolution;
@@ -231,69 +475,38 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     }
     gop->SetMode(gop, bestMode);
 
+    screenW = gop->Mode->Info->HorizontalResolution;
+    screenH = gop->Mode->Info->VerticalResolution;
+    realFb = (uint32_t *)gop->Mode->FrameBufferBase;
+    realStride = gop->Mode->Info->PixelsPerScanLine;
+
+    /* Draw into an off-screen buffer, tightly packed (stride == width),
+     * and only ever touch the real, live-scanned-out framebuffer with a
+     * single fast blit in present(). This is what stops the tearing /
+     * flicker you get from painting shapes directly onto a framebuffer
+     * the display is simultaneously reading from. */
+    VOID *backbuf = NULL;
+    UINTN backbufSize = (UINTN)screenW * screenH * 4;
+    status = BS->AllocatePool(EfiLoaderData, backbufSize, &backbuf);
+    if (EFI_ERROR(status)) { puts_(L"Backbuffer allocation failed\r\n"); return status; }
+
     BootInfo binfo;
-    binfo.framebuffer = (uint32_t *)gop->Mode->FrameBufferBase;
-    binfo.width = gop->Mode->Info->HorizontalResolution;
-    binfo.height = gop->Mode->Info->VerticalResolution;
-    binfo.pixels_per_scanline = gop->Mode->Info->PixelsPerScanLine;
-    screenW = binfo.width;
-    screenH = binfo.height;
+    binfo.framebuffer = (uint32_t *)backbuf;
+    binfo.width = screenW;
+    binfo.height = screenH;
+    binfo.pixels_per_scanline = screenW;
     gfx_init(&binfo);
 
-    /* --- Locate this image and the volume it booted from --- */
     EFI_GUID liGuid = EFI_LOADED_IMAGE_PROTOCOL_GUID;
     EFI_LOADED_IMAGE_PROTOCOL *loadedImage = NULL;
-    status = BS->HandleProtocol(ImageHandle, &liGuid, (VOID **)&loadedImage);
-    if (EFI_ERROR(status)) { puts_(L"LoadedImage failed\r\n"); return status; }
+    BS->HandleProtocol(ImageHandle, &liGuid, (VOID **)&loadedImage);
 
-    EFI_GUID fsGuid = EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID;
-    EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fs = NULL;
-    status = BS->HandleProtocol(loadedImage->DeviceHandle, &fsGuid, (VOID **)&fs);
-    if (EFI_ERROR(status)) { puts_(L"FS protocol failed\r\n"); return status; }
-
-    EFI_FILE_PROTOCOL *root = NULL;
-    status = fs->OpenVolume(fs, &root);
-    if (EFI_ERROR(status)) { puts_(L"OpenVolume failed\r\n"); return status; }
-
-    /* --- Load the kernel into RAM up front; both modes need it --- */
-    EFI_PHYSICAL_ADDRESS kernelAddr;
-    UINTN kernelSize;
-    status = load_kernel(root, &kernelAddr, &kernelSize);
-    if (EFI_ERROR(status)) { puts_(L"KERNEL.BIN load failed\r\n"); return status; }
-
-    /* --- Boot menu: Live (RAM only) or Install (copy to a disk) --- */
     draw_menu();
     char choice = wait_for_choice();
-    if (choice == '2') {
-        do_install(ImageHandle, loadedImage, (VOID *)kernelAddr, kernelSize);
+    if (choice == '2' && loadedImage) {
+        do_install(loadedImage);
     }
 
-    draw_menu();
-    center_string((int)screenH - 40, "STARTING HENTROS...", COL_HINT, 1);
-
-    /* --- Exit boot services and jump to the kernel --- */
-    UINTN mapSize = 0, mapKey, descSize;
-    uint32_t descVer;
-    EFI_MEMORY_DESCRIPTOR *map = NULL;
-    BS->GetMemoryMap(&mapSize, map, &mapKey, &descSize, &descVer);
-    mapSize += descSize * 8;
-    BS->AllocatePool(EfiLoaderData, mapSize, (VOID **)&map);
-    BS->GetMemoryMap(&mapSize, map, &mapKey, &descSize, &descVer);
-
-    status = BS->ExitBootServices(ImageHandle, mapKey);
-    if (EFI_ERROR(status)) {
-        /* Memory map changed between calls; retry once. */
-        mapSize = 0;
-        BS->GetMemoryMap(&mapSize, map, &mapKey, &descSize, &descVer);
-        mapSize += descSize * 8;
-        BS->AllocatePool(EfiLoaderData, mapSize, (VOID **)&map);
-        BS->GetMemoryMap(&mapSize, map, &mapKey, &descSize, &descVer);
-        BS->ExitBootServices(ImageHandle, mapKey);
-    }
-
-    KernelEntry entry = (KernelEntry)kernelAddr;
-    entry(&binfo);
-
-    for (;;) { __asm__ volatile("hlt"); }
+    desktop_loop(); /* never returns */
     return EFI_SUCCESS;
 }

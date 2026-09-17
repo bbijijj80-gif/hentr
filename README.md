@@ -5,43 +5,56 @@ booted through a custom UEFI bootloader. Written from scratch in freestanding
 C — no borrowed OS code, no external EFI SDK.
 
 This is an educational hobby-OS demo, not a production or general-purpose
-operating system. It has no filesystem driver, no process model, no
-networking, and no hardware driver stack beyond a framebuffer, PS/2
-mouse/keyboard polling, and the CMOS real-time clock.
+operating system. It has no filesystem driver, no process model, and no
+networking.
 
 ## What's here
 
-- `boot/` — a minimal UEFI application (`BOOTX64.EFI`). It talks to the
-  firmware directly using a small hand-written subset of the UEFI API
-  (`boot/efi.h`, no gnu-efi/edk2 dependency): it picks a Graphics Output
-  Protocol video mode, draws a boot menu, loads `KERNEL.BIN` from the EFI
-  System Partition, calls `ExitBootServices`, and jumps into the kernel.
-- `kernel/` — a freestanding, flat-binary kernel with no libc. It draws a
-  desktop: a gradient wallpaper, a taskbar with a Start button and a live
-  clock (read from the CMOS RTC), a draggable window with a close button,
-  and a Start menu — all rendered by hand into the linear framebuffer with
-  a small custom 5x7 bitmap font. Mouse and keyboard input come from
-  polling the PS/2 controller directly (no interrupts).
+hentrOS is a single UEFI application (`BOOTX64.EFI`) — it never calls
+`ExitBootServices`, so there's no separate kernel stage. It talks to the
+firmware directly using a small hand-written subset of the UEFI API
+(`boot/efi.h`, no gnu-efi/edk2 dependency):
+
+- `boot/boot.c` — picks a Graphics Output Protocol video mode, draws the
+  boot menu, then runs the whole desktop: a gradient wallpaper, a taskbar
+  with a Start button and a live clock (`EFI_RUNTIME_SERVICES.GetTime`),
+  a draggable window with a close button, and a Start menu.
+- `kernel/gfx.c`, `kernel/font.c` — a small software rasterizer (rects,
+  lines, gradients, a custom 5x7 bitmap font) drawing into an off-screen
+  buffer, plus a `gfx_present()` that blits it to the real framebuffer in
+  one shot each frame. Drawing off-screen and presenting atomically is
+  what keeps the screen flicker/tear-free — painting shapes directly onto
+  a framebuffer the display is simultaneously scanning out causes visible
+  tearing, which is worse the slower the machine draws.
 - `kernel/logo.c` — a stylized, procedurally-drawn recreation of the
   project's hand-drawn yellow-marker logo sketch (a hatched center with
   eight swirling petals), built from integer-only spiral math (no libm).
-  Shared by the bootloader's splash/menu screen and the kernel's desktop.
+
+**Input** goes through UEFI's own protocols instead of raw hardware
+ports: `EFI_SIMPLE_POINTER_PROTOCOL` (falling back to
+`EFI_ABSOLUTE_POINTER_PROTOCOL`) for the mouse, and
+`EFI_SIMPLE_TEXT_INPUT_PROTOCOL` for the keyboard. This matters because
+UEFI's own driver stack understands USB HID devices — almost universal on
+real hardware today — where hand-rolling a PS/2 port driver would not see
+a USB mouse or keyboard at all once boot firmware handed off. Arrow
+keys + Enter/Space always work as a keyboard-only fallback for the whole
+desktop, in case no pointer device is found.
 
 ## Boot menu: Live vs. Install
 
 The bootloader always shows a menu with two choices before it does
 anything to a disk:
 
-- **[1] Live mode** — boots straight into hentrOS from RAM, using only
-  the media it was booted from. Nothing on any disk is written.
+- **[1] Live mode** — runs hentrOS straight from RAM, using only the
+  media it was booted from. Nothing on any disk is written.
 - **[2] Install** — uses the UEFI Simple File System protocol to find
-  another disk volume and copies `BOOTX64.EFI` and `KERNEL.BIN` onto it
-  under a new `\EFI\HENTROS\` directory. It never touches `\EFI\BOOT\`
-  or any other existing file, so an existing Windows/Linux install on
-  that disk is left completely intact — hentrOS just becomes an
-  additional entry you can pick from your firmware's one-time boot menu
-  (e.g. F12/Esc at power-on). After copying, it boots straight into
-  hentrOS itself so you can try it immediately.
+  another disk volume and copies `BOOTX64.EFI` onto it under a new
+  `\EFI\HENTROS\` directory. It never touches `\EFI\BOOT\` or any other
+  existing file, so an existing Windows/Linux install on that disk is
+  left completely intact — hentrOS just becomes an additional entry you
+  can pick from your firmware's one-time boot menu (e.g. F12/Esc at
+  power-on). After copying, it boots straight into hentrOS itself so you
+  can try it immediately.
 
 ## Ready-made ISO
 
@@ -54,28 +67,35 @@ disc), built with:
 make iso
 ```
 
-Use it either as a virtual CD/DVD in a UEFI-enabled VM (VirtualBox,
-VMware, QEMU: `qemu-system-x86_64 -bios OVMF.fd -cdrom hentros.iso`), or
-write it to a USB stick with `dd if=hentros.iso of=/dev/sdX bs=4M status=progress`
-(**check the device name carefully** — this overwrites the whole drive)
-and boot from it on real UEFI hardware. Either way you land on the same
-boot menu described below, and choosing **Live mode** never writes
-anything back to the stick or the machine's own disk.
+**Don't just copy the `.iso` file onto a USB drive** (drag-and-drop /
+Ctrl+C-Ctrl+V) — that only puts a copy of the file on the stick, it does
+not make the stick bootable. Write it with a raw-image tool instead:
+
+- **Windows:** [Rufus](https://rufus.ie) — select the drive, pick
+  `hentros.iso`, partition scheme **GPT**, target system **UEFI
+  (non-CSM)**, and if it asks, write mode **DD Image** (not ISO mode).
+  Or [balenaEtcher](https://etcher.balena.io), which does this
+  automatically.
+- **Linux/macOS:** `dd if=hentros.iso of=/dev/sdX bs=4M status=progress`
+  (**check the device name carefully** — this overwrites the whole
+  drive).
+
+It also works directly as a virtual CD/DVD in a UEFI-enabled VM
+(VirtualBox, VMware, QEMU: `qemu-system-x86_64 -bios OVMF.fd -cdrom
+hentros.iso`). Either way you land on the same boot menu, and **Secure
+Boot must be off** in your firmware settings first — this loader isn't
+signed.
 
 ## Building
 
-Requires `clang`+`lld` (bootloader, built for the `x86_64-unknown-windows`
-/ PE-COFF target so it emits an EFI application) and GNU `binutils`
-(`ld`/`objcopy`, kernel, built as a normal ELF then flattened to a raw
-binary). On Debian/Ubuntu:
+Requires `clang`+`lld` (built for the `x86_64-unknown-windows` / PE-COFF
+target so it emits an EFI application). On Debian/Ubuntu:
 
 ```sh
-apt-get install clang lld binutils qemu-system-x86 ovmf mtools dosfstools
-make
+apt-get install clang lld qemu-system-x86 ovmf mtools dosfstools xorriso
+make        # produces iso/EFI/BOOT/BOOTX64.EFI
+make iso    # also produces hentros.iso
 ```
-
-This produces `iso/EFI/BOOT/BOOTX64.EFI` and `iso/KERNEL.BIN` — the layout
-of a FAT boot volume ready to hand to a UEFI firmware.
 
 ## Running it
 
@@ -84,16 +104,8 @@ make run
 ```
 
 boots the `iso/` directory directly as a FAT volume in QEMU with OVMF
-firmware. Move the mouse to interact with the desktop: click **Start** to
-open the menu, drag the window's title bar to move it, click the red
-**X** to close it.
-
-## How the handoff works
-
-The bootloader and kernel don't share a runtime or calling convention —
-the bootloader is compiled as Windows/PE code (required for UEFI), while
-the kernel is a plain System V ELF. The jump between them is done through
-a function pointer explicitly marked `sysv_abi` on the caller side
-(`boot/boot.c`), and the kernel clears its own `.bss` on entry, since
-`AllocatePages` does not promise zeroed memory (`kernel/kernel.c`,
-`kernel/kernel.ld`).
+firmware, plus emulated USB mouse/keyboard so the real input path gets
+exercised rather than QEMU's default PS/2 devices. Move the mouse to
+interact with the desktop: click **Start** to open the menu, drag the
+window's title bar to move it, click the red **X** to close it — or use
+the arrow keys and Enter if no pointer device is available.

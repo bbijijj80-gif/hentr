@@ -10,6 +10,8 @@
 typedef uint64_t UINTN;
 typedef int64_t INTN;
 typedef uint8_t BOOLEAN;
+#define TRUE 1
+#define FALSE 0
 typedef uint16_t CHAR16;
 typedef void VOID;
 typedef uint64_t EFI_STATUS;
@@ -66,6 +68,69 @@ struct EFI_SIMPLE_TEXT_INPUT_PROTOCOL {
     EFI_EVENT WaitForKey;
 };
 
+/* ---- Simple Pointer Protocol (mouse: PS/2 or USB HID via UEFI's own
+ * driver stack, which is why using this instead of raw port I/O is what
+ * makes USB mice work) ---- */
+typedef struct {
+    int32_t RelativeMovementX;
+    int32_t RelativeMovementY;
+    int32_t RelativeMovementZ;
+    BOOLEAN LeftButton;
+    BOOLEAN RightButton;
+} EFI_SIMPLE_POINTER_STATE;
+
+typedef struct {
+    uint64_t ResolutionX;
+    uint64_t ResolutionY;
+    uint64_t ResolutionZ;
+    BOOLEAN LeftButton;
+    BOOLEAN RightButton;
+} EFI_SIMPLE_POINTER_MODE;
+
+typedef struct EFI_SIMPLE_POINTER_PROTOCOL EFI_SIMPLE_POINTER_PROTOCOL;
+typedef EFI_STATUS (EFIAPI *EFI_SIMPLE_POINTER_RESET)(EFI_SIMPLE_POINTER_PROTOCOL *This, BOOLEAN ExtendedVerification);
+typedef EFI_STATUS (EFIAPI *EFI_SIMPLE_POINTER_GET_STATE)(EFI_SIMPLE_POINTER_PROTOCOL *This, EFI_SIMPLE_POINTER_STATE *State);
+struct EFI_SIMPLE_POINTER_PROTOCOL {
+    EFI_SIMPLE_POINTER_RESET Reset;
+    EFI_SIMPLE_POINTER_GET_STATE GetState;
+    EFI_EVENT WaitForInput;
+    EFI_SIMPLE_POINTER_MODE *Mode;
+};
+
+#define EFI_SIMPLE_POINTER_PROTOCOL_GUID \
+    { 0x31878c87, 0x0b75, 0x11d5, {0x9a, 0x4f, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0xfd} }
+
+/* ---- Absolute Pointer Protocol: an alternative to Simple Pointer that
+ * some firmware exposes instead (touchpads/touchscreens, and some
+ * virtualized pointer devices), giving coordinates directly instead of
+ * relative deltas scaled by an opaque resolution value. ---- */
+typedef struct {
+    uint64_t CurrentX;
+    uint64_t CurrentY;
+    uint64_t CurrentZ;
+    uint32_t ActiveButtons;
+} EFI_ABSOLUTE_POINTER_STATE;
+
+typedef struct {
+    uint64_t AbsoluteMinX, AbsoluteMinY, AbsoluteMinZ;
+    uint64_t AbsoluteMaxX, AbsoluteMaxY, AbsoluteMaxZ;
+    uint32_t Attributes;
+} EFI_ABSOLUTE_POINTER_MODE;
+
+typedef struct EFI_ABSOLUTE_POINTER_PROTOCOL EFI_ABSOLUTE_POINTER_PROTOCOL;
+typedef EFI_STATUS (EFIAPI *EFI_ABSOLUTE_POINTER_RESET)(EFI_ABSOLUTE_POINTER_PROTOCOL *This, BOOLEAN ExtendedVerification);
+typedef EFI_STATUS (EFIAPI *EFI_ABSOLUTE_POINTER_GET_STATE)(EFI_ABSOLUTE_POINTER_PROTOCOL *This, EFI_ABSOLUTE_POINTER_STATE *State);
+struct EFI_ABSOLUTE_POINTER_PROTOCOL {
+    EFI_ABSOLUTE_POINTER_RESET Reset;
+    EFI_ABSOLUTE_POINTER_GET_STATE GetState;
+    EFI_EVENT WaitForInput;
+    EFI_ABSOLUTE_POINTER_MODE *Mode;
+};
+
+#define EFI_ABSOLUTE_POINTER_PROTOCOL_GUID \
+    { 0x8d59d32b, 0xc655, 0x4ae9, {0x9b, 0x15, 0xf2, 0x59, 0x04, 0x99, 0x2a, 0x43} }
+#define EFI_ABSOLUTE_POINTER_TOUCH_ACTIVE 0x00000001
+
 /* ---- Boot services table (only the entries we use) ---- */
 typedef enum { AllocateAnyPages, AllocateMaxAddress, AllocateAddress, MaxAllocateType } EFI_ALLOCATE_TYPE;
 typedef enum { EfiLoaderData = 2, EfiBootServicesData = 4 } EFI_MEMORY_TYPE;
@@ -89,6 +154,7 @@ typedef EFI_STATUS (EFIAPI *EFI_LOCATE_PROTOCOL)(EFI_GUID *Protocol, VOID *Regis
 typedef EFI_STATUS (EFIAPI *EFI_STALL)(UINTN Microseconds);
 typedef enum { AllHandles, ByRegisterNotify, ByProtocol } EFI_LOCATE_SEARCH_TYPE;
 typedef EFI_STATUS (EFIAPI *EFI_LOCATE_HANDLE_BUFFER)(EFI_LOCATE_SEARCH_TYPE SearchType, EFI_GUID *Protocol, VOID *SearchKey, UINTN *NoHandles, EFI_HANDLE **Buffer);
+typedef EFI_STATUS (EFIAPI *EFI_CONNECT_CONTROLLER)(EFI_HANDLE ControllerHandle, EFI_HANDLE *DriverImageHandle, VOID *RemainingDevicePath, BOOLEAN Recursive);
 
 typedef struct {
     uint64_t Signature;
@@ -97,6 +163,22 @@ typedef struct {
     uint32_t CRC32;
     uint32_t Reserved;
 } EFI_TABLE_HEADER;
+
+/* ---- Runtime Services (only GetTime, for a universal, vendor-neutral
+ * clock instead of hand-parsing CMOS registers) ---- */
+typedef struct {
+    uint16_t Year;
+    uint8_t Month, Day, Hour, Minute, Second, Pad1;
+    uint32_t Nanosecond;
+    int16_t TimeZone;
+    uint8_t Daylight, Pad2;
+} EFI_TIME;
+
+typedef EFI_STATUS (EFIAPI *EFI_GET_TIME)(EFI_TIME *Time, VOID *Capabilities);
+typedef struct {
+    EFI_TABLE_HEADER Hdr;
+    EFI_GET_TIME GetTime;
+} EFI_RUNTIME_SERVICES;
 
 typedef struct {
     EFI_TABLE_HEADER Hdr;
@@ -130,7 +212,7 @@ typedef struct {
     void *GetNextMonotonicCount;
     EFI_STALL Stall;
     void *SetWatchdogTimer;
-    void *ConnectController;
+    EFI_CONNECT_CONTROLLER ConnectController;
     void *DisconnectController;
     void *OpenProtocol;
     void *CloseProtocol;
@@ -150,7 +232,7 @@ typedef struct {
     EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *ConOut;
     EFI_HANDLE StandardErrorHandle;
     EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *StdErr;
-    void *RuntimeServices;
+    EFI_RUNTIME_SERVICES *RuntimeServices;
     EFI_BOOT_SERVICES *BootServices;
     UINTN NumberOfTableEntries;
     void *ConfigurationTable;

@@ -14,6 +14,14 @@ void gfx_init(BootInfo *info) {
 uint32_t gfx_width(void) { return fb_w; }
 uint32_t gfx_height(void) { return fb_h; }
 
+void gfx_present(uint32_t *dst, uint32_t dst_stride) {
+    for (uint32_t y = 0; y < fb_h; y++) {
+        uint32_t *srcRow = &fb[y * fb_stride];
+        uint32_t *dstRow = &dst[y * dst_stride];
+        for (uint32_t x = 0; x < fb_w; x++) dstRow[x] = srcRow[x];
+    }
+}
+
 void put_pixel(int x, int y, uint32_t color) {
     if (x < 0 || y < 0 || (uint32_t)x >= fb_w || (uint32_t)y >= fb_h) return;
     fb[y * fb_stride + x] = color;
