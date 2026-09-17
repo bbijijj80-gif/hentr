@@ -68,6 +68,9 @@ static void center_string(int y, const char *s, uint32_t color, int scale) {
  * code at all and, if so, what a given key actually reports as. */
 static int g_pointerCount = -1; /* -1 = not scanned yet */
 static int g_lastScan = -1, g_lastUnicode = -1;
+static const char *g_pointerKind = "NONE";
+static int g_pollTotal = 0, g_pollSuccess = 0;
+static int g_lastRawDx = 0, g_lastRawDy = 0, g_lastDivisor = 1, g_lastBtn = 0;
 
 static void itoa10(int v, char *out) {
     char tmp[12]; int i = 0; int neg = v < 0; if (neg) v = -v;
@@ -105,6 +108,26 @@ static void draw_diagnostics(void) {
     strcat_local(line, " CHAR=");
     itoa10(g_lastUnicode, num); strcat_local(line, num);
     draw_string(6, 4 + FONT_H + 3, line, 0xFFFF40, 1);
+
+    line[0] = 0;
+    strcat_local(line, "TYPE=");
+    strcat_local(line, g_pointerKind);
+    strcat_local(line, " POLLS=");
+    itoa10(g_pollSuccess, num); strcat_local(line, num);
+    strcat_local(line, "/");
+    itoa10(g_pollTotal, num); strcat_local(line, num);
+    draw_string(6, 4 + 2 * (FONT_H + 3), line, 0xFFFF40, 1);
+
+    line[0] = 0;
+    strcat_local(line, "RAWDX=");
+    itoa10(g_lastRawDx, num); strcat_local(line, num);
+    strcat_local(line, " RAWDY=");
+    itoa10(g_lastRawDy, num); strcat_local(line, num);
+    strcat_local(line, " DIV=");
+    itoa10(g_lastDivisor, num); strcat_local(line, num);
+    strcat_local(line, " BTN=");
+    itoa10(g_lastBtn, num); strcat_local(line, num);
+    draw_string(6, 4 + 3 * (FONT_H + 3), line, 0xFFFF40, 1);
 }
 
 /* ============================== Boot menu ============================== */
@@ -523,6 +546,7 @@ static void desktop_loop(void) {
     mouse_y = (int)screenH / 2;
     int left_prev = 0;
     uint32_t rescanCounter = 0;
+    int stuckFallbackTried = 0;
 
     render_frame();
 
@@ -551,9 +575,29 @@ static void desktop_loop(void) {
             }
         }
 
+        /* A pointer protocol can be "found" but dead - registered by
+         * firmware without ever being wired to real hardware, so
+         * GetState never once returns success no matter how much the
+         * mouse actually moves. If that's what happened, stop trusting
+         * it and go straight for the raw USB HID fallback instead. */
+        if (!stuckFallbackTried && ptrs.rawCount == 0 && ptrs.apCount > 0 &&
+            g_pollTotal >= 150 && g_pollSuccess == 0) {
+            stuckFallbackTried = 1;
+            find_raw_hid_mice(&ptrs);
+            g_pollTotal = 0;
+            g_pollSuccess = 0;
+            g_pointerCount = ptrs.spCount + ptrs.apCount + ptrs.rawCount;
+        }
+
         for (int i = 0; i < ptrs.spCount; i++) {
+            g_pointerKind = "SP"; g_pollTotal++;
             EFI_SIMPLE_POINTER_STATE st;
             if (ptrs.sp[i]->GetState(ptrs.sp[i], &st) == EFI_SUCCESS) {
+                g_pollSuccess++;
+                g_lastRawDx = (int)st.RelativeMovementX;
+                g_lastRawDy = (int)st.RelativeMovementY;
+                g_lastDivisor = ptrs.spDivisor[i];
+                g_lastBtn = st.LeftButton;
                 int dx = st.RelativeMovementX / ptrs.spDivisor[i];
                 int dy = st.RelativeMovementY / ptrs.spDivisor[i];
                 if (dx > 60) dx = 60; if (dx < -60) dx = -60;
@@ -564,24 +608,33 @@ static void desktop_loop(void) {
             }
         }
         for (int i = 0; i < ptrs.apCount; i++) {
+            g_pointerKind = "AP"; g_pollTotal++;
             EFI_ABSOLUTE_POINTER_STATE st;
             if (ptrs.ap[i]->GetState(ptrs.ap[i], &st) == EFI_SUCCESS) {
+                g_pollSuccess++;
                 EFI_ABSOLUTE_POINTER_MODE *m = ptrs.ap[i]->Mode;
                 uint64_t rangeX = m->AbsoluteMaxX - m->AbsoluteMinX;
                 uint64_t rangeY = m->AbsoluteMaxY - m->AbsoluteMinY;
+                g_lastRawDx = (int)st.CurrentX;
+                g_lastRawDy = (int)st.CurrentY;
+                g_lastDivisor = (int)rangeX;
+                g_lastBtn = (st.ActiveButtons & EFI_ABSOLUTE_POINTER_TOUCH_ACTIVE) != 0;
                 if (rangeX > 0) mouse_x = (int)(((st.CurrentX - m->AbsoluteMinX) * screenW) / rangeX);
                 if (rangeY > 0) mouse_y = (int)(((st.CurrentY - m->AbsoluteMinY) * screenH) / rangeY);
                 if (st.ActiveButtons & EFI_ABSOLUTE_POINTER_TOUCH_ACTIVE) left_now = 1;
             }
         }
         for (int i = 0; i < ptrs.rawCount; i++) {
+            g_pointerKind = "RAW"; g_pollTotal++;
             uint8_t buf[8];
             UINTN len = 4;
             uint32_t xferStatus = 0;
             EFI_USB_IO_PROTOCOL *io = ptrs.raw[i].io;
             if (io->UsbSyncInterruptTransfer(io, ptrs.raw[i].ep, buf, &len, 1, &xferStatus) == EFI_SUCCESS && len >= 3) {
+                g_pollSuccess++;
                 int dx = (int8_t)buf[1];
                 int dy = (int8_t)buf[2];
+                g_lastRawDx = dx; g_lastRawDy = dy; g_lastDivisor = 1; g_lastBtn = buf[0] & 0x01;
                 if (dx > 60) dx = 60; if (dx < -60) dx = -60;
                 if (dy > 60) dy = 60; if (dy < -60) dy = -60;
                 mouse_x += dx;
