@@ -164,8 +164,11 @@ typedef struct {
     uint32_t Reserved;
 } EFI_TABLE_HEADER;
 
-/* ---- Runtime Services (only GetTime, for a universal, vendor-neutral
- * clock instead of hand-parsing CMOS registers) ---- */
+/* ---- Runtime Services: GetTime (a universal, vendor-neutral clock
+ * instead of hand-parsing CMOS registers) and ResetSystem (reboot). The
+ * struct must keep every field in spec order even though most are
+ * unused, since C struct layout is how we reach ResetSystem's real
+ * offset in the firmware's table. ---- */
 typedef struct {
     uint16_t Year;
     uint8_t Month, Day, Hour, Minute, Second, Pad1;
@@ -174,10 +177,24 @@ typedef struct {
     uint8_t Daylight, Pad2;
 } EFI_TIME;
 
+typedef enum { EfiResetCold, EfiResetWarm, EfiResetShutdown, EfiResetPlatformSpecific } EFI_RESET_TYPE;
+
 typedef EFI_STATUS (EFIAPI *EFI_GET_TIME)(EFI_TIME *Time, VOID *Capabilities);
+typedef void (EFIAPI *EFI_RESET_SYSTEM)(EFI_RESET_TYPE ResetType, EFI_STATUS ResetStatus, UINTN DataSize, VOID *ResetData);
+
 typedef struct {
     EFI_TABLE_HEADER Hdr;
     EFI_GET_TIME GetTime;
+    void *SetTime;
+    void *GetWakeupTime;
+    void *SetWakeupTime;
+    void *SetVirtualAddressMap;
+    void *ConvertPointer;
+    void *GetVariable;
+    void *GetNextVariableName;
+    void *SetVariable;
+    void *GetNextHighMonotonicCount;
+    EFI_RESET_SYSTEM ResetSystem;
 } EFI_RUNTIME_SERVICES;
 
 typedef struct {

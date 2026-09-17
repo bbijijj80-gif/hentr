@@ -265,6 +265,7 @@ typedef struct { int x, y, w, h, visible; } Window;
 
 static Window win = { .x = 220, .y = 120, .w = 420, .h = 260, .visible = 1 };
 static int start_menu_open = 0;
+static int about_open = 0;
 static int dragging = 0;
 static int drag_off_x, drag_off_y;
 static int mouse_x, mouse_y;
@@ -337,6 +338,17 @@ static void draw_window(void) {
     draw_string(win.x + 16, win.y + titleH + 90, "DRAG THIS TITLE BAR TO MOVE ME.", COL_TEXT_DARK, 1);
 }
 
+static void draw_about(void) {
+    int w = 300, h = 120;
+    int x = ((int)screenW - w) / 2, y = ((int)screenH - h) / 2;
+    fill_rect(x, y, w, h, COL_MENU_BG);
+    draw_rect(x, y, w, h, COL_TEXT_LIGHT);
+    draw_string(x + 14, y + 14, "HENTROS - TOY HOBBY OS", COL_TEXT_LIGHT, 1);
+    draw_string(x + 14, y + 40, "A UEFI APPLICATION, NOT A REAL OS.", COL_HINT, 1);
+    draw_string(x + 14, y + 58, "WRITTEN FROM SCRATCH IN C.", COL_HINT, 1);
+    draw_string(x + 14, y + 90, "CLICK ANYWHERE TO CLOSE.", COL_TEXT_LIGHT, 1);
+}
+
 static void draw_desktop_icons(void) {
     fill_rect(30, 30, 48, 40, 0xD8E4F0);
     draw_rect(30, 30, 48, 40, COL_BORDER);
@@ -373,6 +385,7 @@ static void render_frame(void) {
     draw_window();
     draw_taskbar();
     if (start_menu_open) draw_start_menu();
+    if (about_open) draw_about();
     draw_diagnostics();
     draw_cursor(mouse_x, mouse_y);
     present();
@@ -542,7 +555,9 @@ static void desktop_loop(void) {
 
         if (left_click) {
             int ty = (int)screenH - taskbarH;
-            if (rect_hit(mouse_x, mouse_y, 8, ty + 6, 90, taskbarH - 12)) {
+            if (about_open) {
+                about_open = 0; /* any click anywhere closes it */
+            } else if (rect_hit(mouse_x, mouse_y, 8, ty + 6, 90, taskbarH - 12)) {
                 start_menu_open = !start_menu_open;
             } else if (start_menu_open) {
                 int mw = 220, mh = 190, mx = 8, my = (int)screenH - taskbarH - mh;
@@ -550,7 +565,11 @@ static void desktop_loop(void) {
                     for (int i = 0; i < 3; i++) {
                         int iy = my + 40 + i * 30;
                         if (rect_hit(mouse_x, mouse_y, mx + 6, iy, mw - 12, 26)) {
-                            if (i == 0) win.visible = 1;
+                            if (i == 0) { win.visible = 1; win.x = 220; win.y = 120; } /* SHOW WINDOW: snap it back so clicking is visible even if it was already open */
+                            if (i == 1) about_open = 1; /* ABOUT */
+                            if (i == 2 && ST->RuntimeServices && ST->RuntimeServices->ResetSystem) {
+                                ST->RuntimeServices->ResetSystem(EfiResetCold, EFI_SUCCESS, 0, NULL); /* REBOOT */
+                            }
                             start_menu_open = 0;
                         }
                     }
