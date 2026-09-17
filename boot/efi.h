@@ -30,6 +30,7 @@ typedef struct {
 #define EFI_ERROR(x) (((INTN)(x)) < 0)
 
 #define EFI_LOAD_ERROR       EFIERR(1)
+#define EFI_NOT_READY        EFIERR(6)
 #define EFI_NOT_FOUND        EFIERR(14)
 #define EFI_BUFFER_TOO_SMALL EFIERR(5)
 
@@ -48,6 +49,21 @@ struct EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL {
     void *SetCursorPosition;
     void *EnableCursor;
     void *Mode;
+};
+
+/* ---- Simple Text Input (keyboard) ---- */
+typedef struct {
+    uint16_t ScanCode;
+    CHAR16 UnicodeChar;
+} EFI_INPUT_KEY;
+
+typedef struct EFI_SIMPLE_TEXT_INPUT_PROTOCOL EFI_SIMPLE_TEXT_INPUT_PROTOCOL;
+typedef EFI_STATUS (EFIAPI *EFI_INPUT_RESET)(EFI_SIMPLE_TEXT_INPUT_PROTOCOL *This, BOOLEAN ExtendedVerification);
+typedef EFI_STATUS (EFIAPI *EFI_INPUT_READ_KEY)(EFI_SIMPLE_TEXT_INPUT_PROTOCOL *This, EFI_INPUT_KEY *Key);
+struct EFI_SIMPLE_TEXT_INPUT_PROTOCOL {
+    EFI_INPUT_RESET Reset;
+    EFI_INPUT_READ_KEY ReadKeyStroke;
+    EFI_EVENT WaitForKey;
 };
 
 /* ---- Boot services table (only the entries we use) ---- */
@@ -71,6 +87,8 @@ typedef EFI_STATUS (EFIAPI *EFI_EXIT_BOOT_SERVICES)(EFI_HANDLE ImageHandle, UINT
 typedef EFI_STATUS (EFIAPI *EFI_HANDLE_PROTOCOL)(EFI_HANDLE Handle, EFI_GUID *Protocol, VOID **Interface);
 typedef EFI_STATUS (EFIAPI *EFI_LOCATE_PROTOCOL)(EFI_GUID *Protocol, VOID *Registration, VOID **Interface);
 typedef EFI_STATUS (EFIAPI *EFI_STALL)(UINTN Microseconds);
+typedef enum { AllHandles, ByRegisterNotify, ByProtocol } EFI_LOCATE_SEARCH_TYPE;
+typedef EFI_STATUS (EFIAPI *EFI_LOCATE_HANDLE_BUFFER)(EFI_LOCATE_SEARCH_TYPE SearchType, EFI_GUID *Protocol, VOID *SearchKey, UINTN *NoHandles, EFI_HANDLE **Buffer);
 
 typedef struct {
     uint64_t Signature;
@@ -118,7 +136,7 @@ typedef struct {
     void *CloseProtocol;
     void *OpenProtocolInformation;
     void *ProtocolsPerHandle;
-    void *LocateHandleBuffer;
+    EFI_LOCATE_HANDLE_BUFFER LocateHandleBuffer;
     EFI_LOCATE_PROTOCOL LocateProtocol;
 } EFI_BOOT_SERVICES;
 
@@ -127,7 +145,7 @@ typedef struct {
     CHAR16 *FirmwareVendor;
     uint32_t FirmwareRevision;
     EFI_HANDLE ConsoleInHandle;
-    void *ConIn;
+    EFI_SIMPLE_TEXT_INPUT_PROTOCOL *ConIn;
     EFI_HANDLE ConsoleOutHandle;
     EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *ConOut;
     EFI_HANDLE StandardErrorHandle;
@@ -194,6 +212,7 @@ typedef struct EFI_FILE_PROTOCOL EFI_FILE_PROTOCOL;
 typedef EFI_STATUS (EFIAPI *EFI_FILE_OPEN)(EFI_FILE_PROTOCOL *This, EFI_FILE_PROTOCOL **NewHandle, CHAR16 *FileName, uint64_t OpenMode, uint64_t Attributes);
 typedef EFI_STATUS (EFIAPI *EFI_FILE_CLOSE)(EFI_FILE_PROTOCOL *This);
 typedef EFI_STATUS (EFIAPI *EFI_FILE_READ)(EFI_FILE_PROTOCOL *This, UINTN *BufferSize, VOID *Buffer);
+typedef EFI_STATUS (EFIAPI *EFI_FILE_WRITE)(EFI_FILE_PROTOCOL *This, UINTN *BufferSize, VOID *Buffer);
 typedef EFI_STATUS (EFIAPI *EFI_FILE_GET_INFO)(EFI_FILE_PROTOCOL *This, EFI_GUID *InformationType, UINTN *BufferSize, VOID *Buffer);
 typedef EFI_STATUS (EFIAPI *EFI_FILE_SET_POSITION)(EFI_FILE_PROTOCOL *This, uint64_t Position);
 
@@ -203,7 +222,7 @@ struct EFI_FILE_PROTOCOL {
     EFI_FILE_CLOSE Close;
     void *Delete;
     EFI_FILE_READ Read;
-    void *Write;
+    EFI_FILE_WRITE Write;
     void *GetPosition;
     EFI_FILE_SET_POSITION SetPosition;
     EFI_FILE_GET_INFO GetInfo;
@@ -247,5 +266,7 @@ typedef struct {
 
 #define EFI_FILE_MODE_READ   0x0000000000000001ULL
 #define EFI_FILE_MODE_WRITE  0x0000000000000002ULL
+#define EFI_FILE_MODE_CREATE 0x8000000000000000ULL
+#define EFI_FILE_DIRECTORY   0x0000000000000010ULL
 
 #endif

@@ -14,14 +14,34 @@ mouse/keyboard polling, and the CMOS real-time clock.
 - `boot/` — a minimal UEFI application (`BOOTX64.EFI`). It talks to the
   firmware directly using a small hand-written subset of the UEFI API
   (`boot/efi.h`, no gnu-efi/edk2 dependency): it picks a Graphics Output
-  Protocol video mode, loads `KERNEL.BIN` from the EFI System Partition,
-  calls `ExitBootServices`, and jumps into the kernel.
+  Protocol video mode, draws a boot menu, loads `KERNEL.BIN` from the EFI
+  System Partition, calls `ExitBootServices`, and jumps into the kernel.
 - `kernel/` — a freestanding, flat-binary kernel with no libc. It draws a
   desktop: a gradient wallpaper, a taskbar with a Start button and a live
   clock (read from the CMOS RTC), a draggable window with a close button,
   and a Start menu — all rendered by hand into the linear framebuffer with
   a small custom 5x7 bitmap font. Mouse and keyboard input come from
   polling the PS/2 controller directly (no interrupts).
+- `kernel/logo.c` — a stylized, procedurally-drawn recreation of the
+  project's hand-drawn yellow-marker logo sketch (a hatched center with
+  eight swirling petals), built from integer-only spiral math (no libm).
+  Shared by the bootloader's splash/menu screen and the kernel's desktop.
+
+## Boot menu: Live vs. Install
+
+The bootloader always shows a menu with two choices before it does
+anything to a disk:
+
+- **[1] Live mode** — boots straight into hentrOS from RAM, using only
+  the media it was booted from. Nothing on any disk is written.
+- **[2] Install** — uses the UEFI Simple File System protocol to find
+  another disk volume and copies `BOOTX64.EFI` and `KERNEL.BIN` onto it
+  under a new `\EFI\HENTROS\` directory. It never touches `\EFI\BOOT\`
+  or any other existing file, so an existing Windows/Linux install on
+  that disk is left completely intact — hentrOS just becomes an
+  additional entry you can pick from your firmware's one-time boot menu
+  (e.g. F12/Esc at power-on). After copying, it boots straight into
+  hentrOS itself so you can try it immediately.
 
 ## Building
 

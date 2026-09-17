@@ -5,6 +5,7 @@
 #include "rtc.h"
 #include "io.h"
 #include "font.h"
+#include "logo.h"
 
 #define COL_DESKTOP_TOP    0x2F6FB0
 #define COL_DESKTOP_BOTTOM 0x0B3A66
@@ -112,6 +113,9 @@ static void draw_desktop_icons(void) {
     draw_rect(30, 30, 48, 40, COL_BORDER);
     fill_rect(38, 38, 32, 20, 0x1B2733);
     draw_string(18, 76, "MY COMPUTER", COL_TEXT_LIGHT, 1);
+
+    draw_hentros_logo((int)screenW - 90, 90, 2, 0xF6D51A);
+    draw_string((int)screenW - 130, 140, "HENTROS", COL_TEXT_LIGHT, 1);
 }
 
 static void render_scene(void) {
