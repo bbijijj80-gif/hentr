@@ -71,6 +71,10 @@ static int g_lastScan = -1, g_lastUnicode = -1;
 static const char *g_pointerKind = "NONE";
 static int g_pollTotal = 0, g_pollSuccess = 0;
 static int g_lastRawDx = 0, g_lastRawDy = 0, g_lastDivisor = 1, g_lastBtn = 0;
+static int g_xhciFound = 0;
+static uint64_t g_xhciMmioBase = 0;
+static int g_pciHandleCount = -1;
+static uint32_t g_pciLastClassReg = 0;
 
 static void itoa10(int v, char *out) {
     char tmp[12]; int i = 0; int neg = v < 0; if (neg) v = -v;
@@ -128,6 +132,15 @@ static void draw_diagnostics(void) {
     strcat_local(line, " BTN=");
     itoa10(g_lastBtn, num); strcat_local(line, num);
     draw_string(6, 4 + 3 * (FONT_H + 3), line, 0xFFFF40, 1);
+
+    line[0] = 0;
+    strcat_local(line, "XHCI: ");
+    strcat_local(line, g_xhciFound ? "FOUND" : "NOT FOUND");
+    strcat_local(line, " PCIHANDLES=");
+    itoa10(g_pciHandleCount, num); strcat_local(line, num);
+    strcat_local(line, " LASTCLASS=");
+    itoa10((int)g_pciLastClassReg, num); strcat_local(line, num);
+    draw_string(6, 4 + 4 * (FONT_H + 3), line, 0xFFFF40, 1);
 }
 
 /* ============================== Boot menu ============================== */
@@ -449,6 +462,62 @@ static void connect_all_controllers(void) {
     BS->FreePool(handles);
 }
 
+/* ---- xHCI discovery (stage 1 of a from-scratch USB 3 host controller
+ * driver) ----
+ * UEFI's own pointer protocols have proven unreliable on some real
+ * boards (a "found" EFI_ABSOLUTE_POINTER_PROTOCOL instance that never
+ * once returns real movement). The plan is to eventually bypass UEFI's
+ * USB stack entirely and talk to the xHCI controller's registers
+ * directly. Step one is just finding it: walk PCI config space via
+ * EFI_PCI_IO_PROTOCOL looking for the standard xHCI class code
+ * (base class 0x0C serial bus, sub class 0x03 USB, prog-if 0x30 XHCI),
+ * then read its 64-bit MMIO BAR (BAR0/BAR1) so later stages have an
+ * address to map registers at. UEFI identity-maps physical memory, so
+ * the BAR's physical address can be used directly as a pointer once
+ * boot services are still active. */
+static int find_xhci_controller(uint64_t *mmioBaseOut) {
+    EFI_GUID pciIoGuid = EFI_PCI_IO_PROTOCOL_GUID;
+    UINTN n = 0; EFI_HANDLE *h = NULL;
+    if (EFI_ERROR(BS->LocateHandleBuffer(ByProtocol, &pciIoGuid, NULL, &n, &h))) { g_pciHandleCount = -2; return 0; }
+    g_pciHandleCount = (int)n;
+
+    int found = 0;
+    for (UINTN i = 0; i < n; i++) {
+        EFI_PCI_IO_PROTOCOL *pci = NULL;
+        if (EFI_ERROR(BS->HandleProtocol(h[i], &pciIoGuid, (VOID **)&pci)) || !pci) continue;
+
+        /* Read the class-code/revision dword at offset 0x08: byte 0 is
+         * RevisionID, byte 1 ProgIF, byte 2 SubClass, byte 3 BaseClass. */
+        uint32_t classReg = 0;
+        if (EFI_ERROR(pci->Pci.Read(pci, EfiPciIoWidthUint32, 0x08, 1, &classReg))) continue;
+        g_pciLastClassReg = classReg;
+        uint8_t progIf = (uint8_t)(classReg >> 8);
+        uint8_t subClass = (uint8_t)(classReg >> 16);
+        uint8_t baseClass = (uint8_t)(classReg >> 24);
+        if (baseClass != 0x0C || subClass != 0x03 || progIf != 0x30) continue;
+
+        uint32_t bar0 = 0, bar1 = 0;
+        if (EFI_ERROR(pci->Pci.Read(pci, EfiPciIoWidthUint32, PCI_CONFIG_OFFSET_BAR0, 1, &bar0))) continue;
+        /* Bit 2 of a memory BAR's low dword set means it's 64-bit and
+         * BAR1 holds the upper 32 bits; xHCI BARs are always memory
+         * BARs, but check anyway rather than assume. */
+        uint64_t base = bar0 & ~0xFULL;
+        if ((bar0 & 0x6) == 0x4) {
+            if (!EFI_ERROR(pci->Pci.Read(pci, EfiPciIoWidthUint32, PCI_CONFIG_OFFSET_BAR1, 1, &bar1))) {
+                base |= ((uint64_t)bar1) << 32;
+            }
+        }
+        if (base == 0) continue;
+
+        *mmioBaseOut = base;
+        found = 1;
+        break;
+    }
+
+    if (h) BS->FreePool(h);
+    return found;
+}
+
 #define MAX_POINTERS 8
 
 typedef struct {
@@ -561,6 +630,8 @@ static void desktop_loop(void) {
         if (ptrs.spCount > 0 || ptrs.apCount > 0) break;
         BS->Stall(250000);
     }
+
+    g_xhciFound = find_xhci_controller(&g_xhciMmioBase);
 
     mouse_x = (int)screenW / 2;
     mouse_y = (int)screenH / 2;

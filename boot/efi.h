@@ -440,4 +440,55 @@ typedef struct {
 #define EFI_FILE_MODE_CREATE 0x8000000000000000ULL
 #define EFI_FILE_DIRECTORY   0x0000000000000010ULL
 
+/* --- EFI_PCI_IO_PROTOCOL: only the pieces needed to find a PCI device by
+ * class code and read/write its config space (used to locate the xHCI
+ * controller and its MMIO BARs). Other fields are untyped placeholders
+ * that preserve the real struct's layout/offsets. */
+typedef enum {
+    EfiPciIoWidthUint8,
+    EfiPciIoWidthUint16,
+    EfiPciIoWidthUint32,
+    EfiPciIoWidthUint64,
+} EFI_PCI_IO_PROTOCOL_WIDTH;
+
+typedef struct EFI_PCI_IO_PROTOCOL EFI_PCI_IO_PROTOCOL;
+typedef EFI_STATUS (EFIAPI *EFI_PCI_IO_PROTOCOL_CONFIG)(EFI_PCI_IO_PROTOCOL *This, EFI_PCI_IO_PROTOCOL_WIDTH Width, uint32_t Offset, UINTN Count, void *Buffer);
+
+typedef struct {
+    void *Read;
+    void *Write;
+} EFI_PCI_IO_PROTOCOL_ACCESS;
+
+typedef struct {
+    EFI_PCI_IO_PROTOCOL_CONFIG Read;
+    EFI_PCI_IO_PROTOCOL_CONFIG Write;
+} EFI_PCI_IO_PROTOCOL_CONFIG_ACCESS;
+
+struct EFI_PCI_IO_PROTOCOL {
+    void *PollMem;
+    void *PollIo;
+    EFI_PCI_IO_PROTOCOL_ACCESS Mem;
+    EFI_PCI_IO_PROTOCOL_ACCESS Io;
+    EFI_PCI_IO_PROTOCOL_CONFIG_ACCESS Pci;
+    void *CopyMem;
+    void *Map;
+    void *Unmap;
+    void *AllocateBuffer;
+    void *FreeBuffer;
+    void *Flush;
+    void *GetLocation;
+    void *Attributes;
+    void *GetBarAttributes;
+    void *SetBarAttributes;
+    uint64_t RomSize;
+    void *RomImage;
+};
+
+#define EFI_PCI_IO_PROTOCOL_GUID { 0x4CF5B200, 0x68B8, 0x4CA5, {0x9E, 0xEC, 0xB2, 0x3E, 0x3F, 0x50, 0x02, 0x9A} }
+
+/* PCI config offsets used for class-code and BAR lookup. */
+#define PCI_CONFIG_OFFSET_CLASS_REV 0x08 /* 32-bit: [ClassCode(24) SubClass(8) ProgIF... ] actually RevisionID at 0x08, class at 0x09-0x0B */
+#define PCI_CONFIG_OFFSET_BAR0 0x10
+#define PCI_CONFIG_OFFSET_BAR1 0x14
+
 #endif

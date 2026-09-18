@@ -63,6 +63,25 @@ time, which keeps *any* OS (not just this one) from seeing the mouse
 until much later in a normal boot sequence. The on-screen keyboard
 fallback (arrow keys + Enter) works regardless of any of this.
 
+### In progress: a from-scratch xHCI driver
+
+UEFI's own pointer protocols have proven unreliable on some real boards
+(a `EFI_ABSOLUTE_POINTER_PROTOCOL` instance that reports as found but
+never once returns real movement). To eventually bypass UEFI's USB stack
+entirely, `boot/boot.c` is growing an original xHCI (USB 3 host
+controller) driver, written from scratch rather than borrowed from any
+other project:
+
+1. **Done:** find the xHCI controller via `EFI_PCI_IO_PROTOCOL` (PCI
+   class 0x0C/0x03, prog-if 0x30) and read its 64-bit MMIO BAR. Visible
+   in the on-screen diagnostics as `XHCI: FOUND`.
+2. Reset and initialize the controller (Command Ring, Event Ring, Device
+   Context Array).
+3. Scan ports for connected devices.
+4. Enable a device slot, address it, fetch USB descriptors.
+5. Configure an interrupt endpoint and read HID reports from the
+   mouse/keyboard directly off the hardware.
+
 ## Boot menu: Live vs. Install
 
 The bootloader always shows a menu with two choices before it does
