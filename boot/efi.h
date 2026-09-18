@@ -464,6 +464,17 @@ typedef struct {
     EFI_PCI_IO_PROTOCOL_CONFIG Write;
 } EFI_PCI_IO_PROTOCOL_CONFIG_ACCESS;
 
+typedef enum {
+    EfiPciIoAttributeOperationGet,
+    EfiPciIoAttributeOperationSet,
+    EfiPciIoAttributeOperationEnable,
+    EfiPciIoAttributeOperationDisable,
+    EfiPciIoAttributeOperationSupported,
+    EfiPciIoAttributeOperationMaximum,
+} EFI_PCI_IO_PROTOCOL_ATTRIBUTE_OPERATION;
+
+typedef EFI_STATUS (EFIAPI *EFI_PCI_IO_PROTOCOL_ATTRIBUTES)(EFI_PCI_IO_PROTOCOL *This, EFI_PCI_IO_PROTOCOL_ATTRIBUTE_OPERATION Operation, uint64_t Attributes, uint64_t *Result);
+
 struct EFI_PCI_IO_PROTOCOL {
     void *PollMem;
     void *PollIo;
@@ -477,7 +488,7 @@ struct EFI_PCI_IO_PROTOCOL {
     void *FreeBuffer;
     void *Flush;
     void *GetLocation;
-    void *Attributes;
+    EFI_PCI_IO_PROTOCOL_ATTRIBUTES Attributes;
     void *GetBarAttributes;
     void *SetBarAttributes;
     uint64_t RomSize;
@@ -485,6 +496,10 @@ struct EFI_PCI_IO_PROTOCOL {
 };
 
 #define EFI_PCI_IO_PROTOCOL_GUID { 0x4CF5B200, 0x68B8, 0x4CA5, {0x9E, 0xEC, 0xB2, 0x3E, 0x3F, 0x50, 0x02, 0x9A} }
+
+#define EFI_PCI_IO_ATTRIBUTE_IO         0x0100
+#define EFI_PCI_IO_ATTRIBUTE_MEMORY     0x0200
+#define EFI_PCI_IO_ATTRIBUTE_BUS_MASTER 0x0400
 
 /* PCI config offsets used for class-code and BAR lookup. */
 #define PCI_CONFIG_OFFSET_CLASS_REV 0x08 /* 32-bit: [ClassCode(24) SubClass(8) ProgIF... ] actually RevisionID at 0x08, class at 0x09-0x0B */

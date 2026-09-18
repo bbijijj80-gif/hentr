@@ -75,6 +75,10 @@ static int g_xhciFound = 0;
 static uint64_t g_xhciMmioBase = 0;
 static int g_pciHandleCount = -1;
 static uint32_t g_pciLastClassReg = 0;
+static int g_xhciInitOk = 0;
+static uint32_t g_xhciMaxSlots = 0, g_xhciMaxPorts = 0;
+static uint32_t g_xhciUsbStsBefore = 0xFFFFFFFF, g_xhciUsbStsAfter = 0xFFFFFFFF;
+static int g_xhciResetTimedOut = 0, g_xhciStartTimedOut = 0;
 
 static void itoa10(int v, char *out) {
     char tmp[12]; int i = 0; int neg = v < 0; if (neg) v = -v;
@@ -141,6 +145,19 @@ static void draw_diagnostics(void) {
     strcat_local(line, " LASTCLASS=");
     itoa10((int)g_pciLastClassReg, num); strcat_local(line, num);
     draw_string(6, 4 + 4 * (FONT_H + 3), line, 0xFFFF40, 1);
+
+    line[0] = 0;
+    strcat_local(line, "XHCIINIT: ");
+    strcat_local(line, g_xhciInitOk ? "OK" : (g_xhciResetTimedOut ? "RESET TIMEOUT" : (g_xhciStartTimedOut ? "START TIMEOUT" : "NOT RUN")));
+    strcat_local(line, " SLOTS=");
+    itoa10((int)g_xhciMaxSlots, num); strcat_local(line, num);
+    strcat_local(line, " PORTS=");
+    itoa10((int)g_xhciMaxPorts, num); strcat_local(line, num);
+    strcat_local(line, " STS ");
+    itoa10((int)g_xhciUsbStsBefore, num); strcat_local(line, num);
+    strcat_local(line, " TO ");
+    itoa10((int)g_xhciUsbStsAfter, num); strcat_local(line, num);
+    draw_string(6, 4 + 5 * (FONT_H + 3), line, 0xFFFF40, 1);
 }
 
 /* ============================== Boot menu ============================== */
@@ -509,6 +526,17 @@ static int find_xhci_controller(uint64_t *mmioBaseOut) {
         }
         if (base == 0) continue;
 
+        /* Some firmware only enables memory-space decode and bus
+         * mastering (DMA) on a PCI function once its own driver binds
+         * to it. Since we're about to talk to the controller ourselves,
+         * make sure both are on regardless of what firmware already
+         * did - without bus mastering the controller can't write
+         * command completions or events back into our rings at all. */
+        if (pci->Attributes) {
+            pci->Attributes(pci, EfiPciIoAttributeOperationEnable,
+                             EFI_PCI_IO_ATTRIBUTE_MEMORY | EFI_PCI_IO_ATTRIBUTE_BUS_MASTER, NULL);
+        }
+
         *mmioBaseOut = base;
         found = 1;
         break;
@@ -516,6 +544,231 @@ static int find_xhci_controller(uint64_t *mmioBaseOut) {
 
     if (h) BS->FreePool(h);
     return found;
+}
+
+/* ---- xHCI stage 2: controller reset and initialization ----
+ * Register layouts below are transcribed directly from the xHCI 1.2
+ * specification's register field tables (not copied from any existing
+ * driver's source). All registers are little-endian, which matches
+ * x86_64 natively so no byte-swapping is needed. */
+
+typedef struct {
+    volatile uint8_t  CapLength;
+    uint8_t  Rsvd;
+    volatile uint16_t HciVersion;
+    volatile uint32_t HcsParams1;
+    volatile uint32_t HcsParams2;
+    volatile uint32_t HcsParams3;
+    volatile uint32_t HccParams1;
+    volatile uint32_t DbOff;
+    volatile uint32_t RtsOff;
+    volatile uint32_t HccParams2;
+} XhciCapRegs;
+
+typedef struct {
+    volatile uint32_t UsbCmd;
+    volatile uint32_t UsbSts;
+    volatile uint32_t PageSize;
+    uint32_t Rsvd1[2];
+    volatile uint32_t DnCtrl;
+    volatile uint32_t CrcrLo;
+    volatile uint32_t CrcrHi;
+    uint32_t Rsvd2[4];
+    volatile uint32_t DcbaapLo;
+    volatile uint32_t DcbaapHi;
+    volatile uint32_t Config;
+} XhciOpRegs;
+
+typedef struct {
+    volatile uint32_t Portsc;
+    volatile uint32_t Portpmsc;
+    volatile uint32_t Portli;
+    volatile uint32_t Porthlpmc;
+} XhciPortRegs;
+
+typedef struct {
+    volatile uint32_t Iman;
+    volatile uint32_t Imod;
+    volatile uint32_t Erstsz;
+    uint32_t Rsvd;
+    volatile uint32_t ErstbaLo;
+    volatile uint32_t ErstbaHi;
+    volatile uint32_t ErdpLo;
+    volatile uint32_t ErdpHi;
+} XhciIntrRegs;
+
+typedef struct { uint32_t P0, P1, P2, P3; } XhciTrb; /* every TRB is 16 bytes */
+
+typedef struct {
+    uint64_t RingSegmentBase;
+    uint32_t RingSegmentSize;
+    uint32_t Rsvd;
+} XhciErstEntry;
+
+#define XHCI_USBCMD_RUN     0x1u
+#define XHCI_USBCMD_HCRST   0x2u
+#define XHCI_USBSTS_HCH     0x1u
+#define XHCI_USBSTS_CNR     (1u << 11)
+
+#define XHCI_TRB_C_BIT      0x1u
+#define XHCI_TRB_TC_BIT     (1u << 1) /* Toggle Cycle, link TRBs only */
+#define XHCI_TRB_TYPE_SHIFT 10
+#define XHCI_TRB_TYPE_LINK  6u
+
+#define XHCI_CMD_RING_TRBS 16
+#define XHCI_EVT_RING_TRBS 16
+
+/* Everything an already-initialized controller needs to be driven
+ * further (stage 3+): register blocks, the rings, and where the
+ * software cycle-bit/dequeue bookkeeping currently stands. */
+typedef struct {
+    XhciCapRegs *cap;
+    XhciOpRegs *op;
+    XhciPortRegs *ports; /* ports[0] is port #1 */
+    uint32_t *doorbells;
+    XhciIntrRegs *intr0;
+    XhciTrb *cmdRing;
+    uint64_t cmdRingPhys;
+    XhciTrb *evtRing;
+    uint64_t evtRingPhys;
+    int cmdCycle; /* current command-ring producer cycle state */
+    int evtCycle; /* current event-ring consumer cycle state */
+    uint32_t cmdIndex;
+    uint32_t evtIndex;
+    uint32_t maxSlots;
+    uint32_t maxPorts;
+} XhciController;
+
+static XhciController g_xhci;
+
+/* Allocates whole pages (always physically contiguous and page-aligned,
+ * comfortably meeting every alignment requirement the xHCI spec asks
+ * for on these structures) and zeroes them, since AllocatePages makes
+ * no promise about initial content. */
+static void *xhci_alloc_pages(UINTN pages, uint64_t *physOut) {
+    EFI_PHYSICAL_ADDRESS addr = 0;
+    if (EFI_ERROR(BS->AllocatePages(AllocateAnyPages, EfiBootServicesData, pages, &addr))) return NULL;
+    uint8_t *p = (uint8_t *)addr;
+    for (UINTN i = 0; i < pages * 4096; i++) p[i] = 0;
+    if (physOut) *physOut = addr;
+    return (void *)addr;
+}
+
+/* Spins until (*(reg) & mask) == want, or gives up after ~timeoutUs
+ * microseconds. Used for the handful of places the xHCI spec requires
+ * polling a status bit (HCH after stop, CNR after reset, ...). */
+static int xhci_wait_bits(volatile uint32_t *reg, uint32_t mask, uint32_t want, uint32_t timeoutUs) {
+    uint32_t waited = 0;
+    while ((*reg & mask) != want) {
+        if (waited >= timeoutUs) return 0;
+        BS->Stall(1000);
+        waited += 1000;
+    }
+    return 1;
+}
+
+/* Resets the controller and stands up the three structures every xHCI
+ * controller needs before it can run at all: the Device Context Base
+ * Address Array (one slot per addressable device, plus slot 0 for
+ * scratchpad), a Command Ring (software -> controller requests), and
+ * an Event Ring (controller -> software completions/notifications).
+ * No interrupts are wired up - later stages just poll the event ring
+ * directly, which the spec fully allows. */
+static int xhci_init(uint64_t mmioBase) {
+    XhciCapRegs *cap = (XhciCapRegs *)mmioBase;
+    uint8_t capLen = cap->CapLength;
+    XhciOpRegs *op = (XhciOpRegs *)(mmioBase + capLen);
+    uint32_t hcsParams1 = cap->HcsParams1;
+    uint32_t maxSlots = hcsParams1 & 0xFF;
+    uint32_t maxPorts = (hcsParams1 >> 24) & 0xFF;
+    uint32_t dbOff = cap->DbOff & ~0x3u;
+    uint32_t rtsOff = cap->RtsOff & ~0x1Fu;
+    uint32_t *doorbells = (uint32_t *)(mmioBase + dbOff);
+    XhciIntrRegs *intr0 = (XhciIntrRegs *)(mmioBase + rtsOff + 0x20);
+    XhciPortRegs *ports = (XhciPortRegs *)((uint8_t *)op + 0x400);
+
+    g_xhciUsbStsBefore = op->UsbSts;
+
+    /* Stop the controller (it may already be running, e.g. if
+     * firmware's own driver had it up), then wait for it to actually
+     * halt before resetting - resetting a still-running controller is
+     * not well-defined behavior. */
+    op->UsbCmd &= ~XHCI_USBCMD_RUN;
+    xhci_wait_bits(&op->UsbSts, XHCI_USBSTS_HCH, XHCI_USBSTS_HCH, 1000000);
+
+    op->UsbCmd |= XHCI_USBCMD_HCRST;
+    if (!xhci_wait_bits(&op->UsbCmd, XHCI_USBCMD_HCRST, 0, 1000000)) { g_xhciResetTimedOut = 1; return 0; }
+    if (!xhci_wait_bits(&op->UsbSts, XHCI_USBSTS_CNR, 0, 1000000)) { g_xhciResetTimedOut = 1; return 0; }
+
+    op->Config = maxSlots;
+
+    UINTN dcbaaPages = ((maxSlots + 1) * 8 + 4095) / 4096;
+    if (dcbaaPages == 0) dcbaaPages = 1;
+    uint64_t dcbaaPhys = 0;
+    uint64_t *dcbaa = (uint64_t *)xhci_alloc_pages(dcbaaPages, &dcbaaPhys);
+    if (!dcbaa) return 0;
+    op->DcbaapLo = (uint32_t)dcbaaPhys;
+    op->DcbaapHi = (uint32_t)(dcbaaPhys >> 32);
+
+    uint64_t cmdRingPhys = 0;
+    XhciTrb *cmdRing = (XhciTrb *)xhci_alloc_pages(1, &cmdRingPhys);
+    if (!cmdRing) return 0;
+    /* The last TRB in the ring is a Link TRB pointing back at the
+     * start, with the Toggle Cycle bit set so the producer cycle state
+     * flips every lap - the standard way to make a fixed-size buffer
+     * behave as a ring. Its own cycle bit must match the ring's
+     * initial producer cycle state (1) since software "owns" it at
+     * setup time just like any other TRB slot. */
+    XhciTrb *cmdLink = &cmdRing[XHCI_CMD_RING_TRBS - 1];
+    cmdLink->P0 = (uint32_t)cmdRingPhys;
+    cmdLink->P1 = (uint32_t)(cmdRingPhys >> 32);
+    cmdLink->P3 = (XHCI_TRB_TYPE_LINK << XHCI_TRB_TYPE_SHIFT) | XHCI_TRB_TC_BIT | XHCI_TRB_C_BIT;
+
+    op->CrcrLo = (uint32_t)(cmdRingPhys & 0xFFFFFFFFu) | 0x1u; /* RCS = 1 */
+    op->CrcrHi = (uint32_t)(cmdRingPhys >> 32);
+
+    uint64_t evtRingPhys = 0;
+    XhciTrb *evtRing = (XhciTrb *)xhci_alloc_pages(1, &evtRingPhys);
+    if (!evtRing) return 0;
+
+    uint64_t erstPhys = 0;
+    XhciErstEntry *erst = (XhciErstEntry *)xhci_alloc_pages(1, &erstPhys);
+    if (!erst) return 0;
+    erst[0].RingSegmentBase = evtRingPhys;
+    erst[0].RingSegmentSize = XHCI_EVT_RING_TRBS;
+
+    /* Order matters here per spec: segment table size, then the
+     * dequeue pointer, then the segment table base address. */
+    intr0->Erstsz = 1;
+    intr0->ErdpLo = (uint32_t)(evtRingPhys & 0xFFFFFFFFu);
+    intr0->ErdpHi = (uint32_t)(evtRingPhys >> 32);
+    intr0->ErstbaLo = (uint32_t)(erstPhys & 0xFFFFFFFFu);
+    intr0->ErstbaHi = (uint32_t)(erstPhys >> 32);
+
+    op->UsbCmd |= XHCI_USBCMD_RUN;
+    if (!xhci_wait_bits(&op->UsbSts, XHCI_USBSTS_HCH, 0, 1000000)) { g_xhciStartTimedOut = 1; return 0; }
+
+    g_xhciUsbStsAfter = op->UsbSts;
+
+    g_xhci.cap = cap;
+    g_xhci.op = op;
+    g_xhci.ports = ports;
+    g_xhci.doorbells = doorbells;
+    g_xhci.intr0 = intr0;
+    g_xhci.cmdRing = cmdRing;
+    g_xhci.cmdRingPhys = cmdRingPhys;
+    g_xhci.evtRing = evtRing;
+    g_xhci.evtRingPhys = evtRingPhys;
+    g_xhci.cmdCycle = 1;
+    g_xhci.evtCycle = 1;
+    g_xhci.cmdIndex = 0;
+    g_xhci.evtIndex = 0;
+    g_xhci.maxSlots = maxSlots;
+    g_xhci.maxPorts = maxPorts;
+    g_xhciMaxSlots = maxSlots;
+    g_xhciMaxPorts = maxPorts;
+
+    return 1;
 }
 
 #define MAX_POINTERS 8
@@ -632,6 +885,7 @@ static void desktop_loop(void) {
     }
 
     g_xhciFound = find_xhci_controller(&g_xhciMmioBase);
+    if (g_xhciFound) g_xhciInitOk = xhci_init(g_xhciMmioBase);
 
     mouse_x = (int)screenW / 2;
     mouse_y = (int)screenH / 2;

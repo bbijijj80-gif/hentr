@@ -75,8 +75,15 @@ other project:
 1. **Done:** find the xHCI controller via `EFI_PCI_IO_PROTOCOL` (PCI
    class 0x0C/0x03, prog-if 0x30) and read its 64-bit MMIO BAR. Visible
    in the on-screen diagnostics as `XHCI: FOUND`.
-2. Reset and initialize the controller (Command Ring, Event Ring, Device
-   Context Array).
+2. **Done:** reset and initialize the controller: stop it, issue a host
+   controller reset, program the Device Context Base Address Array,
+   set up a Command Ring and an Event Ring (polled, no interrupts
+   wired up), and start it running again. Visible as `XHCIINIT: OK`
+   with the controller's slot/port counts and `USBSTS` before/after.
+   Taking over the controller this way resets whatever firmware's own
+   USB stack had going, so `EFI_ABSOLUTE_POINTER_PROTOCOL` support
+   disappears at this point - expected, since our own driver is meant
+   to replace it once later stages can actually read a port.
 3. Scan ports for connected devices.
 4. Enable a device slot, address it, fetch USB descriptors.
 5. Configure an interrupt endpoint and read HID reports from the
