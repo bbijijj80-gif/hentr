@@ -113,6 +113,31 @@ move, the on-screen diagnostics (`XHCIMOUSE`, `XHCISTATE`, `XHCIEVT`)
 show exactly how far bring-up got, which is the fastest way to narrow
 down what's different about that board.
 
+## Command line
+
+A small terminal window: click the **CMD** desktop icon or **Start ->
+Command Line** to open it, or **EXIT**/its close button to dismiss it.
+It has its own keyboard focus while open (so typing doesn't also nudge
+the mouse cursor or trigger clicks on whatever's underneath), a
+scrollback buffer, and a handful of built-in commands:
+
+| Command       | Does |
+|---------------|------|
+| `HELP`        | list the built-in commands |
+| `ABOUT`       | about hentrOS |
+| `VER`         | show the version |
+| `TIME` / `DATE` | current time/date via `EFI_RUNTIME_SERVICES.GetTime` |
+| `ECHO text`   | print text back |
+| `CLS`         | clear the screen |
+| `REBOOT`      | restart the machine |
+| `EXIT`        | close the window |
+
+There's no real filesystem or process model behind it - consistent
+with the rest of this toy OS, it's a fixed set of built-ins rather than
+a shell that launches programs. The custom 5x7 bitmap font only covers
+`0-9`, `A-Z`, and a handful of punctuation (`: . , - ! '`), so command
+output sticks to that set rather than symbols like `< > _ \ [ ]`.
+
 ## Boot menu: Live vs. Install
 
 The bootloader always shows a menu with two choices before it does

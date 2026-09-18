@@ -411,12 +411,149 @@ static void do_install(EFI_LOADED_IMAGE_PROTOCOL *loadedImage) {
 typedef struct { int x, y, w, h, visible; } Window;
 
 static Window win = { .x = 220, .y = 120, .w = 420, .h = 260, .visible = 1 };
+static Window cmdWin = { .x = 300, .y = 180, .w = 520, .h = 210, .visible = 0 };
 static int start_menu_open = 0;
 static int about_open = 0;
+/* 0 = nothing being dragged, 1 = the welcome window, 2 = the command
+ * line window - both windows share the same drag machinery, just
+ * applied to whichever one a titlebar drag started on. */
 static int dragging = 0;
 static int drag_off_x, drag_off_y;
 static int mouse_x, mouse_y;
 static int taskbarH = 40;
+
+/* ---- Command line ----
+ * A small scrollback terminal: a ring buffer of completed lines plus
+ * the line currently being typed. Kept intentionally simple - a
+ * handful of built-in commands, no real filesystem or process model,
+ * consistent with the rest of this toy OS. */
+#define CMD_COLS 78
+#define CMD_MAX_LINES 200
+#define CMD_VISIBLE_ROWS 17
+
+static char cmd_lines[CMD_MAX_LINES][CMD_COLS + 1];
+static int cmd_line_count = 0;   /* how many lines are in use, caps at CMD_MAX_LINES */
+static int cmd_line_start = 0;   /* ring buffer head once it wraps */
+static char cmd_input[CMD_COLS + 1];
+static int cmd_input_len = 0;
+
+static void cmd_println(const char *s) {
+    char *dst = cmd_lines[(cmd_line_start + cmd_line_count) % CMD_MAX_LINES];
+    int i = 0;
+    while (s[i] && i < CMD_COLS) { dst[i] = s[i]; i++; }
+    dst[i] = 0;
+    if (cmd_line_count < CMD_MAX_LINES) {
+        cmd_line_count++;
+    } else {
+        cmd_line_start = (cmd_line_start + 1) % CMD_MAX_LINES;
+    }
+}
+
+static void cmd_clear(void) {
+    cmd_line_count = 0;
+    cmd_line_start = 0;
+}
+
+static int cmd_streq_ci(const char *a, const char *b) {
+    while (*a && *b) {
+        char ca = *a, cb = *b;
+        if (ca >= 'a' && ca <= 'z') ca -= 32;
+        if (cb >= 'a' && cb <= 'z') cb -= 32;
+        if (ca != cb) return 0;
+        a++; b++;
+    }
+    return *a == 0 && *b == 0;
+}
+
+/* itoa10() always writes the shortest decimal form (no leading
+ * zero), so pad single digits by hand for HH:MM:SS / YYYY-MM-DD. */
+static void cmd_append_2digit(char *out, int v) {
+    char num[12];
+    if (v < 10) strcat_local(out, "0");
+    itoa10(v, num);
+    strcat_local(out, num);
+}
+
+static void cmd_execute(const char *lineIn) {
+    char line[CMD_COLS + 1];
+    int n = 0;
+    while (lineIn[n] && n < CMD_COLS) { line[n] = lineIn[n]; n++; }
+    line[n] = 0;
+
+    char echoLine[CMD_COLS + 8];
+    echoLine[0] = 0;
+    strcat_local(echoLine, "CMD: ");
+    strcat_local(echoLine, line);
+    cmd_println(echoLine);
+
+    int i = 0;
+    while (line[i] == ' ') i++;
+    char cmdWord[CMD_COLS + 1];
+    int ci = 0;
+    while (line[i] && line[i] != ' ' && ci < CMD_COLS) cmdWord[ci++] = line[i++];
+    cmdWord[ci] = 0;
+    while (line[i] == ' ') i++;
+    const char *rest = &line[i];
+
+    if (cmdWord[0] == 0) {
+        /* blank line: nothing to do */
+    } else if (cmd_streq_ci(cmdWord, "HELP")) {
+        cmd_println("BUILT-IN COMMANDS:");
+        cmd_println("  HELP           SHOW THIS LIST");
+        cmd_println("  ABOUT          ABOUT HENTROS");
+        cmd_println("  VER            SHOW THE VERSION");
+        cmd_println("  TIME           SHOW THE CURRENT TIME");
+        cmd_println("  DATE           SHOW THE CURRENT DATE");
+        cmd_println("  ECHO TEXT      PRINT TEXT BACK");
+        cmd_println("  CLS            CLEAR THE SCREEN");
+        cmd_println("  REBOOT         RESTART THE MACHINE");
+        cmd_println("  EXIT           CLOSE THIS WINDOW");
+    } else if (cmd_streq_ci(cmdWord, "ABOUT")) {
+        cmd_println("HENTROS - A TOY HOBBY OPERATING SYSTEM.");
+        cmd_println("A UEFI APPLICATION, NOT A REAL OS.");
+        cmd_println("WRITTEN FROM SCRATCH IN C.");
+    } else if (cmd_streq_ci(cmdWord, "VER")) {
+        cmd_println("HENTROS - VERSION 0.1");
+    } else if (cmd_streq_ci(cmdWord, "TIME") || cmd_streq_ci(cmdWord, "DATE")) {
+        EFI_TIME t;
+        if (ST->RuntimeServices && ST->RuntimeServices->GetTime &&
+            ST->RuntimeServices->GetTime(&t, NULL) == EFI_SUCCESS) {
+            char buf[40]; buf[0] = 0;
+            if (cmd_streq_ci(cmdWord, "TIME")) {
+                cmd_append_2digit(buf, t.Hour);
+                strcat_local(buf, ":");
+                cmd_append_2digit(buf, t.Minute);
+                strcat_local(buf, ":");
+                cmd_append_2digit(buf, t.Second);
+            } else {
+                char num[12];
+                itoa10(t.Year, num); strcat_local(buf, num);
+                strcat_local(buf, "-");
+                cmd_append_2digit(buf, t.Month);
+                strcat_local(buf, "-");
+                cmd_append_2digit(buf, t.Day);
+            }
+            cmd_println(buf);
+        } else {
+            cmd_println("TIME NOT AVAILABLE.");
+        }
+    } else if (cmd_streq_ci(cmdWord, "ECHO")) {
+        cmd_println(rest);
+    } else if (cmd_streq_ci(cmdWord, "CLS") || cmd_streq_ci(cmdWord, "CLEAR")) {
+        cmd_clear();
+    } else if (cmd_streq_ci(cmdWord, "REBOOT")) {
+        if (ST->RuntimeServices && ST->RuntimeServices->ResetSystem)
+            ST->RuntimeServices->ResetSystem(EfiResetCold, EFI_SUCCESS, 0, NULL);
+    } else if (cmd_streq_ci(cmdWord, "EXIT") || cmd_streq_ci(cmdWord, "CLOSE")) {
+        cmdWin.visible = 0;
+    } else {
+        char msg[CMD_COLS + 40]; msg[0] = 0;
+        strcat_local(msg, "'");
+        strcat_local(msg, cmdWord);
+        strcat_local(msg, "' IS NOT RECOGNIZED AS A COMMAND. TYPE HELP.");
+        cmd_println(msg);
+    }
+}
 
 static int rect_hit(int px, int py, int x, int y, int w, int h) {
     return px >= x && px < x + w && py >= y && py < y + h;
@@ -448,16 +585,17 @@ static void draw_taskbar(void) {
     draw_string((int)screenW - tw - 14, ty + (taskbarH - FONT_H) / 2, buf, COL_TEXT_LIGHT, 1);
 }
 
+#define START_MENU_ITEM_COUNT 4
 static void draw_start_menu(void) {
-    int mw = 220, mh = 190;
+    int mw = 220, mh = 40 + START_MENU_ITEM_COUNT * 30 + 10;
     int mx = 8, my = (int)screenH - taskbarH - mh;
     fill_rect(mx, my, mw, mh, COL_MENU_BG);
     draw_rect(mx, my, mw, mh, COL_TASKBAR_EDGE);
     draw_string(mx + 12, my + 12, "HENTROS MENU", COL_TEXT_LIGHT, 1);
     draw_hline(mx + 8, my + 28, mw - 16, COL_TASKBAR_EDGE);
 
-    const char *items[] = { "SHOW WINDOW", "ABOUT", "REBOOT" };
-    for (int i = 0; i < 3; i++) {
+    const char *items[START_MENU_ITEM_COUNT] = { "SHOW WINDOW", "COMMAND LINE", "ABOUT", "REBOOT" };
+    for (int i = 0; i < START_MENU_ITEM_COUNT; i++) {
         int iy = my + 40 + i * 30;
         if (rect_hit(mouse_x, mouse_y, mx + 6, iy, mw - 12, 26))
             fill_rect(mx + 6, iy, mw - 12, 26, COL_MENU_HI);
@@ -485,6 +623,47 @@ static void draw_window(void) {
     draw_string(win.x + 16, win.y + titleH + 90, "DRAG THIS TITLE BAR TO MOVE ME.", COL_TEXT_DARK, 1);
 }
 
+static uint32_t g_cmdBlinkFrame = 0;
+
+static void draw_cmd_window(void) {
+    if (!cmdWin.visible) return;
+    int titleH = 24;
+    fill_rect(cmdWin.x, cmdWin.y, cmdWin.w, titleH, COL_TASKBAR);
+    draw_string(cmdWin.x + 10, cmdWin.y + (titleH - FONT_H) / 2, "COMMAND LINE", COL_TEXT_LIGHT, 1);
+
+    int cbx = cmdWin.x + cmdWin.w - 22, cby = cmdWin.y + 4, cbs = 16;
+    fill_rect(cbx, cby, cbs, cbs, COL_CLOSE_BTN);
+    draw_string(cbx + 4, cby + 4, "X", COL_TEXT_LIGHT, 1);
+
+    int bodyY = cmdWin.y + titleH;
+    int bodyH = cmdWin.h - titleH;
+    fill_rect(cmdWin.x, bodyY, cmdWin.w, bodyH, 0x0C0C0C);
+    draw_rect(cmdWin.x, cmdWin.y, cmdWin.w, cmdWin.h, COL_BORDER);
+    draw_hline(cmdWin.x, bodyY, cmdWin.w, COL_BORDER);
+
+    int lineH = FONT_H + 2;
+    int padX = 8, padY = 6;
+    int row = 0;
+    int firstVisible = cmd_line_count > CMD_VISIBLE_ROWS ? cmd_line_count - CMD_VISIBLE_ROWS : 0;
+    for (int i = firstVisible; i < cmd_line_count; i++) {
+        const char *s = cmd_lines[(cmd_line_start + i) % CMD_MAX_LINES];
+        draw_string(cmdWin.x + padX, bodyY + padY + row * lineH, s, 0x3DDC5A, 1);
+        row++;
+    }
+
+    /* Current input line, with a blinking block cursor after it. */
+    char promptLine[CMD_COLS + 8];
+    promptLine[0] = 0;
+    strcat_local(promptLine, "CMD: ");
+    strcat_local(promptLine, cmd_input);
+    int py = bodyY + padY + row * lineH;
+    draw_string(cmdWin.x + padX, py, promptLine, 0x3DDC5A, 1);
+    if ((g_cmdBlinkFrame / 30) % 2 == 0) {
+        int cx = cmdWin.x + padX + text_width(promptLine, 1);
+        fill_rect(cx, py, FONT_W, FONT_H, 0x3DDC5A);
+    }
+}
+
 static void draw_about(void) {
     int w = 300, h = 120;
     int x = ((int)screenW - w) / 2, y = ((int)screenH - h) / 2;
@@ -496,11 +675,21 @@ static void draw_about(void) {
     draw_string(x + 14, y + 90, "CLICK ANYWHERE TO CLOSE.", COL_TEXT_LIGHT, 1);
 }
 
+#define CMD_ICON_X 30
+#define CMD_ICON_Y 110
+#define CMD_ICON_W 48
+#define CMD_ICON_H 40
+
 static void draw_desktop_icons(void) {
     fill_rect(30, 30, 48, 40, 0xD8E4F0);
     draw_rect(30, 30, 48, 40, COL_BORDER);
     fill_rect(38, 38, 32, 20, 0x1B2733);
     draw_string(18, 76, "MY COMPUTER", COL_TEXT_LIGHT, 1);
+
+    fill_rect(CMD_ICON_X, CMD_ICON_Y, CMD_ICON_W, CMD_ICON_H, 0x0C0C0C);
+    draw_rect(CMD_ICON_X, CMD_ICON_Y, CMD_ICON_W, CMD_ICON_H, COL_BORDER);
+    draw_string(CMD_ICON_X + 8, CMD_ICON_Y + 14, "CMD", 0x3DDC5A, 1);
+    draw_string(4, CMD_ICON_Y + CMD_ICON_H + 6, "COMMAND LINE", COL_TEXT_LIGHT, 1);
 
     draw_hentros_logo((int)screenW - 90, 90, 2, 0xF6D51A);
     draw_string((int)screenW - 130, 140, "HENTROS", COL_TEXT_LIGHT, 1);
@@ -530,12 +719,14 @@ static void render_frame(void) {
     fill_gradient_v(0, 0, screenW, screenH - taskbarH, COL_DESKTOP_TOP, COL_DESKTOP_BOTTOM);
     draw_desktop_icons();
     draw_window();
+    draw_cmd_window();
     draw_taskbar();
     if (start_menu_open) draw_start_menu();
     if (about_open) draw_about();
     draw_diagnostics();
     draw_cursor(mouse_x, mouse_y);
     present();
+    g_cmdBlinkFrame++;
 }
 
 /* Some firmware only binds USB HID drivers (mouse/keyboard) lazily, on
@@ -1480,6 +1671,10 @@ static void desktop_loop(void) {
     uint32_t rescanCounter = 0;
     int stuckFallbackTried = 0;
 
+    cmd_println("HENTROS COMMAND LINE - VERSION 0.1");
+    cmd_println("TYPE HELP FOR A LIST OF COMMANDS.");
+    cmd_println("");
+
     render_frame();
 
     for (;;) {
@@ -1602,11 +1797,27 @@ static void desktop_loop(void) {
 
         /* Keyboard is always available (arrow keys move the cursor,
          * Enter/Space clicks) so the desktop stays usable even without
-         * a working pointer device. */
+         * a working pointer device. While the command line is open it
+         * takes exclusive keyboard focus instead - typing there would
+         * be useless if every keystroke also nudged the mouse cursor
+         * or triggered a click on whatever's underneath it. */
         EFI_INPUT_KEY key;
         while (ST->ConIn->ReadKeyStroke(ST->ConIn, &key) == EFI_SUCCESS) {
             g_lastScan = key.ScanCode;
             g_lastUnicode = (int)key.UnicodeChar;
+            if (cmdWin.visible) {
+                if (key.UnicodeChar == 13) {
+                    cmd_execute(cmd_input);
+                    cmd_input[0] = 0;
+                    cmd_input_len = 0;
+                } else if (key.UnicodeChar == 8) {
+                    if (cmd_input_len > 0) cmd_input[--cmd_input_len] = 0;
+                } else if (key.UnicodeChar >= 32 && key.UnicodeChar < 127 && cmd_input_len < CMD_COLS) {
+                    cmd_input[cmd_input_len++] = (char)key.UnicodeChar;
+                    cmd_input[cmd_input_len] = 0;
+                }
+                continue;
+            }
             switch (key.ScanCode) {
                 case 1: mouse_y -= 10; break; /* up */
                 case 2: mouse_y += 10; break; /* down */
@@ -1631,14 +1842,15 @@ static void desktop_loop(void) {
             } else if (rect_hit(mouse_x, mouse_y, 8, ty + 6, 90, taskbarH - 12)) {
                 start_menu_open = !start_menu_open;
             } else if (start_menu_open) {
-                int mw = 220, mh = 190, mx = 8, my = (int)screenH - taskbarH - mh;
+                int mw = 220, mh = 40 + START_MENU_ITEM_COUNT * 30 + 10, mx = 8, my = (int)screenH - taskbarH - mh;
                 if (rect_hit(mouse_x, mouse_y, mx, my, mw, mh)) {
-                    for (int i = 0; i < 3; i++) {
+                    for (int i = 0; i < START_MENU_ITEM_COUNT; i++) {
                         int iy = my + 40 + i * 30;
                         if (rect_hit(mouse_x, mouse_y, mx + 6, iy, mw - 12, 26)) {
                             if (i == 0) { win.visible = 1; win.x = 220; win.y = 120; } /* SHOW WINDOW: snap it back so clicking is visible even if it was already open */
-                            if (i == 1) about_open = 1; /* ABOUT */
-                            if (i == 2 && ST->RuntimeServices && ST->RuntimeServices->ResetSystem) {
+                            if (i == 1) { cmdWin.visible = 1; } /* COMMAND LINE */
+                            if (i == 2) about_open = 1; /* ABOUT */
+                            if (i == 3 && ST->RuntimeServices && ST->RuntimeServices->ResetSystem) {
                                 ST->RuntimeServices->ResetSystem(EfiResetCold, EFI_SUCCESS, 0, NULL); /* REBOOT */
                             }
                             start_menu_open = 0;
@@ -1647,26 +1859,59 @@ static void desktop_loop(void) {
                 } else {
                     start_menu_open = 0;
                 }
-            } else if (win.visible) {
-                int cbx = win.x + win.w - 24, cby = win.y + 5, cbs = 18;
-                if (rect_hit(mouse_x, mouse_y, cbx, cby, cbs, cbs)) {
-                    win.visible = 0;
-                } else if (rect_hit(mouse_x, mouse_y, win.x, win.y, win.w, 28)) {
-                    dragging = 1;
-                    drag_off_x = mouse_x - win.x;
-                    drag_off_y = mouse_y - win.y;
+            } else {
+                /* The command line is drawn on top of the welcome window,
+                 * so it gets first refusal on a click - clicking inside
+                 * its body still consumes the click (so it doesn't fall
+                 * through and drag the window underneath it). */
+                int handled = 0;
+                if (cmdWin.visible) {
+                    int cbx = cmdWin.x + cmdWin.w - 22, cby = cmdWin.y + 4, cbs = 16;
+                    if (rect_hit(mouse_x, mouse_y, cbx, cby, cbs, cbs)) {
+                        cmdWin.visible = 0;
+                        handled = 1;
+                    } else if (rect_hit(mouse_x, mouse_y, cmdWin.x, cmdWin.y, cmdWin.w, 24)) {
+                        dragging = 2;
+                        drag_off_x = mouse_x - cmdWin.x;
+                        drag_off_y = mouse_y - cmdWin.y;
+                        handled = 1;
+                    } else if (rect_hit(mouse_x, mouse_y, cmdWin.x, cmdWin.y, cmdWin.w, cmdWin.h)) {
+                        handled = 1;
+                    }
+                }
+                if (!handled && win.visible) {
+                    int cbx = win.x + win.w - 24, cby = win.y + 5, cbs = 18;
+                    if (rect_hit(mouse_x, mouse_y, cbx, cby, cbs, cbs)) {
+                        win.visible = 0;
+                        handled = 1;
+                    } else if (rect_hit(mouse_x, mouse_y, win.x, win.y, win.w, 28)) {
+                        dragging = 1;
+                        drag_off_x = mouse_x - win.x;
+                        drag_off_y = mouse_y - win.y;
+                        handled = 1;
+                    }
+                }
+                if (!handled && rect_hit(mouse_x, mouse_y, CMD_ICON_X, CMD_ICON_Y, CMD_ICON_W, CMD_ICON_H)) {
+                    cmdWin.visible = 1;
                 }
             }
         }
         if (left_release) dragging = 0;
 
-        if (dragging && left_now) {
+        if (dragging == 1 && left_now) {
             win.x = mouse_x - drag_off_x;
             win.y = mouse_y - drag_off_y;
             if (win.x < 0) win.x = 0;
             if (win.y < 0) win.y = 0;
             if (win.x + win.w > (int)screenW) win.x = (int)screenW - win.w;
             if (win.y + win.h > (int)screenH - taskbarH) win.y = (int)screenH - taskbarH - win.h;
+        } else if (dragging == 2 && left_now) {
+            cmdWin.x = mouse_x - drag_off_x;
+            cmdWin.y = mouse_y - drag_off_y;
+            if (cmdWin.x < 0) cmdWin.x = 0;
+            if (cmdWin.y < 0) cmdWin.y = 0;
+            if (cmdWin.x + cmdWin.w > (int)screenW) cmdWin.x = (int)screenW - cmdWin.w;
+            if (cmdWin.y + cmdWin.h > (int)screenH - taskbarH) cmdWin.y = (int)screenH - taskbarH - cmdWin.h;
         }
 
         left_prev = left_now;
