@@ -1,5 +1,7 @@
 # hentrOS
 
+**English** | [Русский](README.ru.md) | [中文](README.zh.md)
+
 A tiny hobby toy operating system with a Windows-like graphical desktop,
 booted through a custom UEFI bootloader. Written from scratch in freestanding
 C — no borrowed OS code, no external EFI SDK.
