@@ -63,31 +63,55 @@ time, which keeps *any* OS (not just this one) from seeing the mouse
 until much later in a normal boot sequence. The on-screen keyboard
 fallback (arrow keys + Enter) works regardless of any of this.
 
-### In progress: a from-scratch xHCI driver
+### A from-scratch xHCI mouse driver
 
 UEFI's own pointer protocols have proven unreliable on some real boards
 (a `EFI_ABSOLUTE_POINTER_PROTOCOL` instance that reports as found but
-never once returns real movement). To eventually bypass UEFI's USB stack
-entirely, `boot/boot.c` is growing an original xHCI (USB 3 host
-controller) driver, written from scratch rather than borrowed from any
-other project:
+never once returns real movement). `boot/boot.c` now has an original
+xHCI (USB 3 host controller) driver, written from scratch rather than
+borrowed from any other project, that bypasses UEFI's USB stack
+entirely for the mouse:
 
-1. **Done:** find the xHCI controller via `EFI_PCI_IO_PROTOCOL` (PCI
-   class 0x0C/0x03, prog-if 0x30) and read its 64-bit MMIO BAR. Visible
-   in the on-screen diagnostics as `XHCI: FOUND`.
-2. **Done:** reset and initialize the controller: stop it, issue a host
+1. Find the xHCI controller via `EFI_PCI_IO_PROTOCOL` (PCI class
+   0x0C/0x03, prog-if 0x30), enable its PCI memory decode and bus
+   mastering, and read its 64-bit MMIO BAR. Visible as `XHCI: FOUND`.
+2. Reset and initialize the controller: stop it, issue a host
    controller reset, program the Device Context Base Address Array,
-   set up a Command Ring and an Event Ring (polled, no interrupts
-   wired up), and start it running again. Visible as `XHCIINIT: OK`
-   with the controller's slot/port counts and `USBSTS` before/after.
-   Taking over the controller this way resets whatever firmware's own
-   USB stack had going, so `EFI_ABSOLUTE_POINTER_PROTOCOL` support
-   disappears at this point - expected, since our own driver is meant
-   to replace it once later stages can actually read a port.
-3. Scan ports for connected devices.
-4. Enable a device slot, address it, fetch USB descriptors.
-5. Configure an interrupt endpoint and read HID reports from the
-   mouse/keyboard directly off the hardware.
+   set up a Command Ring and a polled Event Ring, and start it running
+   again. Visible as `XHCIINIT: OK`. Taking over the controller this
+   way resets whatever firmware's own USB stack had going, so
+   `EFI_ABSOLUTE_POINTER_PROTOCOL` support disappears at this point -
+   expected, since this driver replaces it.
+3. Scan every root hub port for a connected device, issuing a Port
+   Reset where needed (works for both USB2 and USB3 ports on xHCI).
+4. Enable a device slot, address it (`Address Device`), and fetch its
+   configuration descriptor over the default control endpoint to find
+   an interrupt IN endpoint - preferring one inside a HID boot-protocol
+   mouse interface, but accepting any interrupt IN endpoint as a
+   fallback. Sets the configuration and, for HID interfaces, switches
+   to Boot Protocol.
+5. Issues `Configure Endpoint` for that interrupt endpoint and keeps a
+   Normal TRB in flight on it, decoding each completed HID boot-mouse
+   report (buttons, signed dx/dy) directly - no UEFI pointer protocol
+   involved. Visible as `XHCIMOUSE: ACTIVE` with the port/slot/endpoint
+   it bound to, and `XHCISTATE` showing the controller's own Slot/
+   Endpoint state (Configured/Running once everything is live).
+
+This has been verified end-to-end in QEMU (`qemu-xhci` + `usb-mouse`):
+port scan, slot enable, addressing, descriptor parsing, configuration,
+and endpoint setup all succeed, and the controller's own state
+afterward reads back as Slot Configured / Endpoint Running exactly as
+it should. Confirming that *live HID reports* flow all the way through
+in an automated, headless QEMU test turned out to be blocked by QEMU's
+own input routing (it has three competing virtual pointer devices -
+PS/2, an absolute "vmmouse", and the USB HID mouse - and neither the
+monitor's `mouse_move`, QMP's `input-send-event`, nor VNC pointer
+events could be pinned to the USB one in that harness), not something
+traceable to a bug in this driver. On real hardware there's only one
+physical mouse, so that ambiguity doesn't apply - if it still doesn't
+move, the on-screen diagnostics (`XHCIMOUSE`, `XHCISTATE`, `XHCIEVT`)
+show exactly how far bring-up got, which is the fastest way to narrow
+down what's different about that board.
 
 ## Boot menu: Live vs. Install
 

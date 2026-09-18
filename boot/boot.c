@@ -18,6 +18,15 @@
 static EFI_SYSTEM_TABLE *ST;
 static EFI_BOOT_SERVICES *BS;
 
+/* -ffreestanding means no libc, but clang still emits calls to memcpy
+ * for things like struct assignment - provide the one symbol it needs. */
+void *memcpy(void *dst, const void *src, UINTN n) {
+    uint8_t *d = (uint8_t *)dst;
+    const uint8_t *s = (const uint8_t *)src;
+    for (UINTN i = 0; i < n; i++) d[i] = s[i];
+    return dst;
+}
+
 static void puts_(CHAR16 *s) {
     ST->ConOut->OutputString(ST->ConOut, s);
 }
@@ -79,6 +88,15 @@ static int g_xhciInitOk = 0;
 static uint32_t g_xhciMaxSlots = 0, g_xhciMaxPorts = 0;
 static uint32_t g_xhciUsbStsBefore = 0xFFFFFFFF, g_xhciUsbStsAfter = 0xFFFFFFFF;
 static int g_xhciResetTimedOut = 0, g_xhciStartTimedOut = 0;
+static int g_xhciMouseActive = 0;
+static uint32_t g_xhciMousePort = 0, g_xhciMouseSpeed = 0, g_xhciMouseSlot = 0;
+static uint32_t g_xhciAnyEventCount = 0;
+static uint32_t g_xhciMouseEpAddr = 0, g_xhciMouseInterval = 0, g_xhciMouseMaxPacket = 0, g_xhciMouseIsHid = 0;
+static uint32_t g_xhciMouseArmCount = 0, g_xhciMouseEvtCount = 0;
+static uint32_t g_xhciLastEvtType = 0, g_xhciLastEvtCC = 0;
+static uint32_t g_xhciCfgEpAttempted = 0, g_xhciCfgEpGotEvt = 0, g_xhciCfgEpCC = 0xFF;
+static int g_xhciCfgEpAllocIntrFailed = 0, g_xhciCfgEpAllocBufFailed = 0, g_xhciCfgEpEntered = 0;
+static uint32_t g_xhciOutSlotState = 0xFF, g_xhciOutEpState = 0xFF, g_xhciPortscSnapshot = 0;
 
 static void itoa10(int v, char *out) {
     char tmp[12]; int i = 0; int neg = v < 0; if (neg) v = -v;
@@ -158,6 +176,62 @@ static void draw_diagnostics(void) {
     strcat_local(line, " TO ");
     itoa10((int)g_xhciUsbStsAfter, num); strcat_local(line, num);
     draw_string(6, 4 + 5 * (FONT_H + 3), line, 0xFFFF40, 1);
+
+    line[0] = 0;
+    strcat_local(line, "XHCIMOUSE: ");
+    strcat_local(line, g_xhciMouseActive ? "ACTIVE" : "NONE");
+    strcat_local(line, " PORT=");
+    itoa10((int)g_xhciMousePort, num); strcat_local(line, num);
+    strcat_local(line, " SPEED=");
+    itoa10((int)g_xhciMouseSpeed, num); strcat_local(line, num);
+    strcat_local(line, " SLOT=");
+    itoa10((int)g_xhciMouseSlot, num); strcat_local(line, num);
+    strcat_local(line, " EP=");
+    itoa10((int)g_xhciMouseEpAddr, num); strcat_local(line, num);
+    strcat_local(line, " IVL=");
+    itoa10((int)g_xhciMouseInterval, num); strcat_local(line, num);
+    strcat_local(line, " MP=");
+    itoa10((int)g_xhciMouseMaxPacket, num); strcat_local(line, num);
+    strcat_local(line, " HID=");
+    itoa10((int)g_xhciMouseIsHid, num); strcat_local(line, num);
+    draw_string(6, 4 + 6 * (FONT_H + 3), line, 0xFFFF40, 1);
+
+    line[0] = 0;
+    strcat_local(line, "XHCIEVT: ANY=");
+    itoa10((int)g_xhciAnyEventCount, num); strcat_local(line, num);
+    strcat_local(line, " ARMS=");
+    itoa10((int)g_xhciMouseArmCount, num); strcat_local(line, num);
+    strcat_local(line, " GOT=");
+    itoa10((int)g_xhciMouseEvtCount, num); strcat_local(line, num);
+    strcat_local(line, " LASTTYPE=");
+    itoa10((int)g_xhciLastEvtType, num); strcat_local(line, num);
+    strcat_local(line, " LASTCC=");
+    itoa10((int)g_xhciLastEvtCC, num); strcat_local(line, num);
+    draw_string(6, 4 + 7 * (FONT_H + 3), line, 0xFFFF40, 1);
+
+    line[0] = 0;
+    strcat_local(line, "XHCICFGEP: ATTEMPTED=");
+    itoa10((int)g_xhciCfgEpAttempted, num); strcat_local(line, num);
+    strcat_local(line, " GOTEVT=");
+    itoa10((int)g_xhciCfgEpGotEvt, num); strcat_local(line, num);
+    strcat_local(line, " CC=");
+    itoa10((int)g_xhciCfgEpCC, num); strcat_local(line, num);
+    strcat_local(line, " ENTERED=");
+    itoa10((int)g_xhciCfgEpEntered, num); strcat_local(line, num);
+    strcat_local(line, " ALLOCINTR=");
+    itoa10((int)g_xhciCfgEpAllocIntrFailed, num); strcat_local(line, num);
+    strcat_local(line, " ALLOCBUF=");
+    itoa10((int)g_xhciCfgEpAllocBufFailed, num); strcat_local(line, num);
+    draw_string(6, 4 + 8 * (FONT_H + 3), line, 0xFFFF40, 1);
+
+    line[0] = 0;
+    strcat_local(line, "XHCISTATE: SLOTSTATE=");
+    itoa10((int)g_xhciOutSlotState, num); strcat_local(line, num);
+    strcat_local(line, " EPSTATE=");
+    itoa10((int)g_xhciOutEpState, num); strcat_local(line, num);
+    strcat_local(line, " PORTSC=");
+    itoa10((int)g_xhciPortscSnapshot, num); strcat_local(line, num);
+    draw_string(6, 4 + 9 * (FONT_H + 3), line, 0xFFFF40, 1);
 }
 
 /* ============================== Boot menu ============================== */
@@ -613,10 +687,67 @@ typedef struct {
 #define XHCI_TRB_C_BIT      0x1u
 #define XHCI_TRB_TC_BIT     (1u << 1) /* Toggle Cycle, link TRBs only */
 #define XHCI_TRB_TYPE_SHIFT 10
-#define XHCI_TRB_TYPE_LINK  6u
+#define XHCI_TRB_TYPE_LINK      6u
+#define XHCI_TRB_TYPE_SETUP     2u
+#define XHCI_TRB_TYPE_DATA      3u
+#define XHCI_TRB_TYPE_STATUS    4u
+#define XHCI_TRB_TYPE_NORMAL    1u
+#define XHCI_TRB_TYPE_ENABLE_SLOT     9u
+#define XHCI_TRB_TYPE_ADDRESS_DEVICE  11u
+#define XHCI_TRB_TYPE_CONFIG_ENDPOINT 12u
+#define XHCI_TRB_TYPE_TRANSFER_EVENT  32u
+#define XHCI_TRB_TYPE_CMD_COMPLETION  33u
+#define XHCI_TRB_TYPE_PORT_STATUS_CHANGE 34u
 
 #define XHCI_CMD_RING_TRBS 16
 #define XHCI_EVT_RING_TRBS 16
+
+/* A ring buffer of TRBs with the last slot reserved for a Link TRB back
+ * to the start (the standard xHCI technique for turning a fixed-size
+ * buffer into a logical ring), plus the software-side bookkeeping
+ * (index, producer/consumer cycle state) needed to enqueue into it.
+ * Used for the Command Ring and for every endpoint's Transfer Ring. */
+typedef struct {
+    XhciTrb *trbs;
+    uint64_t phys;
+    uint32_t size; /* TRB slots, including the trailing link TRB */
+    uint32_t index;
+    int cycle;
+} XhciRing;
+
+static void xhci_ring_init(XhciRing *r, XhciTrb *trbs, uint64_t phys, uint32_t size) {
+    r->trbs = trbs; r->phys = phys; r->size = size; r->index = 0; r->cycle = 1;
+    XhciTrb *link = &trbs[size - 1];
+    link->P0 = (uint32_t)(phys & 0xFFFFFFFFu);
+    link->P1 = (uint32_t)(phys >> 32);
+    link->P3 = (XHCI_TRB_TYPE_LINK << XHCI_TRB_TYPE_SHIFT) | XHCI_TRB_TC_BIT | XHCI_TRB_C_BIT;
+}
+
+/* Returns the next TRB slot to fill, transparently handling wrap: when
+ * the ring's last slot is reached, (re)writes the Link TRB with the
+ * *current* producer cycle bit before wrapping - required every lap,
+ * since the link TRB is written by the producer just like any other
+ * TRB and must match the producer's cycle state at that moment. */
+static XhciTrb *xhci_ring_reserve(XhciRing *r) {
+    if (r->index == r->size - 1) {
+        XhciTrb *link = &r->trbs[r->size - 1];
+        link->P3 = (link->P3 & ~XHCI_TRB_C_BIT) | (uint32_t)r->cycle;
+        r->index = 0;
+        r->cycle ^= 1;
+    }
+    XhciTrb *slot = &r->trbs[r->index];
+    r->index++;
+    return slot;
+}
+
+/* Cycle bit is written last (after the rest of the TRB's fields) so the
+ * controller never observes a partially-written TRB as valid. */
+static void xhci_ring_submit(XhciRing *r, XhciTrb *trb, uint32_t p0, uint32_t p1, uint32_t p2, uint32_t p3NoCycle) {
+    trb->P0 = p0;
+    trb->P1 = p1;
+    trb->P2 = p2;
+    trb->P3 = (p3NoCycle & ~XHCI_TRB_C_BIT) | (uint32_t)r->cycle;
+}
 
 /* Everything an already-initialized controller needs to be driven
  * further (stage 3+): register blocks, the rings, and where the
@@ -627,19 +758,22 @@ typedef struct {
     XhciPortRegs *ports; /* ports[0] is port #1 */
     uint32_t *doorbells;
     XhciIntrRegs *intr0;
-    XhciTrb *cmdRing;
-    uint64_t cmdRingPhys;
+    uint64_t *dcbaa;
+    XhciRing cmd;
     XhciTrb *evtRing;
     uint64_t evtRingPhys;
-    int cmdCycle; /* current command-ring producer cycle state */
     int evtCycle; /* current event-ring consumer cycle state */
-    uint32_t cmdIndex;
     uint32_t evtIndex;
     uint32_t maxSlots;
     uint32_t maxPorts;
+    uint32_t ctxSize; /* 32 or 64 bytes per device/endpoint context */
 } XhciController;
 
 static XhciController g_xhci;
+
+static void xhci_doorbell(XhciController *x, uint32_t slotId, uint32_t target) {
+    x->doorbells[slotId] = target;
+}
 
 /* Allocates whole pages (always physically contiguous and page-aligned,
  * comfortably meeting every alignment requirement the xHCI spec asks
@@ -711,18 +845,10 @@ static int xhci_init(uint64_t mmioBase) {
     op->DcbaapHi = (uint32_t)(dcbaaPhys >> 32);
 
     uint64_t cmdRingPhys = 0;
-    XhciTrb *cmdRing = (XhciTrb *)xhci_alloc_pages(1, &cmdRingPhys);
-    if (!cmdRing) return 0;
-    /* The last TRB in the ring is a Link TRB pointing back at the
-     * start, with the Toggle Cycle bit set so the producer cycle state
-     * flips every lap - the standard way to make a fixed-size buffer
-     * behave as a ring. Its own cycle bit must match the ring's
-     * initial producer cycle state (1) since software "owns" it at
-     * setup time just like any other TRB slot. */
-    XhciTrb *cmdLink = &cmdRing[XHCI_CMD_RING_TRBS - 1];
-    cmdLink->P0 = (uint32_t)cmdRingPhys;
-    cmdLink->P1 = (uint32_t)(cmdRingPhys >> 32);
-    cmdLink->P3 = (XHCI_TRB_TYPE_LINK << XHCI_TRB_TYPE_SHIFT) | XHCI_TRB_TC_BIT | XHCI_TRB_C_BIT;
+    XhciTrb *cmdRingTrbs = (XhciTrb *)xhci_alloc_pages(1, &cmdRingPhys);
+    if (!cmdRingTrbs) return 0;
+    XhciRing cmdRing;
+    xhci_ring_init(&cmdRing, cmdRingTrbs, cmdRingPhys, XHCI_CMD_RING_TRBS);
 
     op->CrcrLo = (uint32_t)(cmdRingPhys & 0xFFFFFFFFu) | 0x1u; /* RCS = 1 */
     op->CrcrHi = (uint32_t)(cmdRingPhys >> 32);
@@ -755,19 +881,471 @@ static int xhci_init(uint64_t mmioBase) {
     g_xhci.ports = ports;
     g_xhci.doorbells = doorbells;
     g_xhci.intr0 = intr0;
-    g_xhci.cmdRing = cmdRing;
-    g_xhci.cmdRingPhys = cmdRingPhys;
+    g_xhci.dcbaa = dcbaa;
+    g_xhci.cmd = cmdRing;
     g_xhci.evtRing = evtRing;
     g_xhci.evtRingPhys = evtRingPhys;
-    g_xhci.cmdCycle = 1;
     g_xhci.evtCycle = 1;
-    g_xhci.cmdIndex = 0;
     g_xhci.evtIndex = 0;
     g_xhci.maxSlots = maxSlots;
     g_xhci.maxPorts = maxPorts;
+    g_xhci.ctxSize = (cap->HccParams1 & 0x4) ? 64 : 32; /* CSZ bit */
     g_xhciMaxSlots = maxSlots;
     g_xhciMaxPorts = maxPorts;
 
+    return 1;
+}
+
+/* ---- xHCI stages 3-5: port scan, device bring-up, interrupt polling ----
+ * From here on this is an original (if minimal) USB stack: enumerate
+ * ports, address a device, walk its configuration descriptor for an
+ * interrupt IN endpoint, switch it into HID Boot Protocol, and keep a
+ * single Normal TRB in flight on that endpoint to receive reports.
+ * Only mice are driven this way; keyboard input keeps using UEFI's own
+ * EFI_SIMPLE_TEXT_INPUT_PROTOCOL; a from-scratch driver only needs to
+ * replace the one thing that was actually unreliable. */
+
+#define XHCI_SPEED_FULL  1u
+#define XHCI_SPEED_LOW   2u
+#define XHCI_SPEED_HIGH  3u
+#define XHCI_SPEED_SUPER 4u
+
+static uint32_t xhci_ep0_max_packet(uint32_t speed) {
+    if (speed == XHCI_SPEED_HIGH) return 64;
+    if (speed == XHCI_SPEED_SUPER) return 512;
+    return 8; /* low and full speed both start at 8 until told otherwise */
+}
+
+/* The Endpoint Context's Interval field is 2^Interval * 125us, not a
+ * raw millisecond count. High/Super speed descriptors already give
+ * bInterval as an exponent (1-16), needing only a -1 shift; Low/Full
+ * speed descriptors give bInterval in whole 1ms frames (8 * 125us),
+ * which has to be converted to the nearest power-of-two exponent. */
+static uint32_t xhci_encode_interval(uint32_t speed, uint8_t descInterval) {
+    if (descInterval == 0) descInterval = 1;
+    if (speed == XHCI_SPEED_HIGH || speed == XHCI_SPEED_SUPER) {
+        uint32_t v = descInterval;
+        if (v > 16) v = 16;
+        return v - 1;
+    }
+    uint32_t target = (uint32_t)descInterval * 8;
+    uint32_t n = 0, p = 1;
+    while (p < target && n < 15) { p <<= 1; n++; }
+    return n;
+}
+
+/* Drains the event ring looking for a TRB of wantType (and, for
+ * completion-style events, a matching slot ID). Every event seen along
+ * the way - including ones that don't match, like an unrelated Port
+ * Status Change - is consumed and the hardware dequeue pointer (ERDP)
+ * advanced, so nothing the caller doesn't care about can ever wedge
+ * the ring. */
+static int xhci_event_poll(XhciController *x, uint32_t wantType, uint32_t wantSlot, XhciTrb *out, uint32_t timeoutUs) {
+    uint32_t waited = 0;
+    for (;;) {
+        int any = 0;
+        for (;;) {
+            XhciTrb *trb = &x->evtRing[x->evtIndex];
+            if ((trb->P3 & XHCI_TRB_C_BIT) != (uint32_t)x->evtCycle) break;
+            any = 1;
+            XhciTrb got = *trb;
+            x->evtIndex++;
+            if (x->evtIndex == XHCI_EVT_RING_TRBS) { x->evtIndex = 0; x->evtCycle ^= 1; }
+            uint64_t erdp = x->evtRingPhys + (uint64_t)x->evtIndex * 16;
+            x->intr0->ErdpLo = (uint32_t)(erdp & 0xFFFFFFF0u) | 0x8u; /* clear EHB */
+            x->intr0->ErdpHi = (uint32_t)(erdp >> 32);
+            g_xhciAnyEventCount++;
+
+            uint32_t type = (got.P3 >> XHCI_TRB_TYPE_SHIFT) & 0x3F;
+            g_xhciLastEvtType = type;
+            g_xhciLastEvtCC = (got.P2 >> 24) & 0xFF;
+            if (type == wantType) {
+                uint32_t slotId = (got.P3 >> 24) & 0xFF;
+                if (wantSlot == 0xFFFFFFFFu || slotId == wantSlot) {
+                    if (out) *out = got;
+                    return 1;
+                }
+            }
+        }
+        if (!any) {
+            if (waited >= timeoutUs) return 0;
+            BS->Stall(1000);
+            waited += 1000;
+        }
+    }
+}
+
+static int xhci_cmd_wait(XhciController *x, XhciTrb *trbOut, uint32_t wantSlot, uint32_t timeoutUs) {
+    xhci_doorbell(x, 0, 0);
+    if (!xhci_event_poll(x, XHCI_TRB_TYPE_CMD_COMPLETION, wantSlot, trbOut, timeoutUs)) return 0;
+    return ((trbOut->P2 >> 24) & 0xFF) == 1; /* Completion Code == Success */
+}
+
+static int xhci_enable_slot(XhciController *x, uint32_t *slotIdOut) {
+    XhciTrb *t = xhci_ring_reserve(&x->cmd);
+    xhci_ring_submit(&x->cmd, t, 0, 0, 0, XHCI_TRB_TYPE_ENABLE_SLOT << XHCI_TRB_TYPE_SHIFT);
+    XhciTrb evt;
+    if (!xhci_cmd_wait(x, &evt, 0xFFFFFFFFu, 1000000)) return 0;
+    *slotIdOut = (evt.P3 >> 24) & 0xFF;
+    return 1;
+}
+
+/* A device's usable state after Address Device: the output context the
+ * controller writes into, its own control (EP0) transfer ring, and
+ * (once configured) its interrupt IN endpoint's transfer ring. */
+typedef struct {
+    int active;
+    uint32_t slotId;
+    uint32_t portNum1;   /* 1-based root hub port number */
+    uint32_t speed;
+    uint32_t maxPacket0;
+    void *inputCtx; uint64_t inputCtxPhys;
+    void *outputCtx; uint64_t outputCtxPhys;
+    XhciRing ep0;
+    XhciRing intr;
+    uint32_t intrDci;
+    uint32_t intrMaxPacket;
+    uint8_t *reportBuf; uint64_t reportBufPhys;
+} XhciMouse;
+
+static XhciMouse g_xhciMouse;
+
+static int xhci_address_device(XhciController *x, XhciMouse *m) {
+    uint32_t ctxSize = x->ctxSize;
+    uint64_t inputPhys = 0;
+    uint8_t *input = (uint8_t *)xhci_alloc_pages(1, &inputPhys);
+    if (!input) return 0;
+    uint64_t outputPhys = 0;
+    uint8_t *output = (uint8_t *)xhci_alloc_pages(1, &outputPhys);
+    if (!output) return 0;
+
+    uint64_t ep0RingPhys = 0;
+    XhciTrb *ep0RingTrbs = (XhciTrb *)xhci_alloc_pages(1, &ep0RingPhys);
+    if (!ep0RingTrbs) return 0;
+    xhci_ring_init(&m->ep0, ep0RingTrbs, ep0RingPhys, XHCI_CMD_RING_TRBS);
+
+    uint32_t *icc = (uint32_t *)(input + 0);
+    icc[1] = 0x3; /* A0 (slot context) | A1 (EP0 context) */
+
+    uint32_t *slotCtx = (uint32_t *)(input + ctxSize);
+    slotCtx[0] = (1u << 27) | (m->speed << 20); /* Context Entries=1, Speed */
+    slotCtx[1] = ((m->portNum1 & 0xFF) << 16);  /* Root Hub Port Number */
+
+    uint32_t *ep0Ctx = (uint32_t *)(input + 2 * ctxSize);
+    ep0Ctx[1] = (4u << 3) | (3u << 1) | (m->maxPacket0 << 16); /* EP Type=Control, CErr=3 */
+    uint64_t ep0Deq = ep0RingPhys | 1u; /* DCS = 1 */
+    ep0Ctx[2] = (uint32_t)(ep0Deq & 0xFFFFFFFFu);
+    ep0Ctx[3] = (uint32_t)(ep0Deq >> 32);
+    ep0Ctx[4] = 8u; /* Average TRB Length */
+
+    x->dcbaa[m->slotId] = outputPhys;
+
+    XhciTrb *t = xhci_ring_reserve(&x->cmd);
+    uint32_t p3 = (XHCI_TRB_TYPE_ADDRESS_DEVICE << XHCI_TRB_TYPE_SHIFT) | ((m->slotId & 0xFF) << 24);
+    xhci_ring_submit(&x->cmd, t, (uint32_t)(inputPhys & 0xFFFFFFFFu), (uint32_t)(inputPhys >> 32), 0, p3);
+    XhciTrb evt;
+    if (!xhci_cmd_wait(x, &evt, m->slotId, 1000000)) return 0;
+
+    m->inputCtx = input;
+    m->inputCtxPhys = inputPhys;
+    m->outputCtx = output;
+    m->outputCtxPhys = outputPhys;
+    return 1;
+}
+
+/* Runs one control transfer on a device's EP0 ring: Setup stage, an
+ * optional Data stage, and a Status stage (direction always opposite
+ * the Data stage, or IN for a no-data request) - the standard 3-part
+ * shape every USB control transfer takes. */
+static int xhci_control_transfer(XhciController *x, XhciMouse *m, uint8_t bmRequestType, uint8_t bRequest,
+                                  uint16_t wValue, uint16_t wIndex, uint16_t wLength, void *buf, uint64_t bufPhys) {
+    int isIn = (bmRequestType & 0x80) != 0;
+    int hasData = wLength != 0;
+
+    XhciTrb *setup = xhci_ring_reserve(&m->ep0);
+    uint32_t w0 = bmRequestType | ((uint32_t)bRequest << 8) | ((uint32_t)wValue << 16);
+    uint32_t w1 = wIndex | ((uint32_t)wLength << 16);
+    uint32_t trt = hasData ? (isIn ? 3u : 2u) : 0u;
+    uint32_t setupP3 = (XHCI_TRB_TYPE_SETUP << XHCI_TRB_TYPE_SHIFT) | (trt << 16) | (1u << 6) /* IDT */ | (hasData ? (1u << 4) : 0);
+    xhci_ring_submit(&m->ep0, setup, w0, w1, 8u, setupP3);
+
+    if (hasData) {
+        XhciTrb *data = xhci_ring_reserve(&m->ep0);
+        uint32_t dataP3 = (XHCI_TRB_TYPE_DATA << XHCI_TRB_TYPE_SHIFT) | ((isIn ? 1u : 0u) << 16) | (1u << 4) /* CH */;
+        xhci_ring_submit(&m->ep0, data, (uint32_t)(bufPhys & 0xFFFFFFFFu), (uint32_t)(bufPhys >> 32), wLength, dataP3);
+    }
+
+    XhciTrb *status = xhci_ring_reserve(&m->ep0);
+    uint32_t statusDir = hasData ? (isIn ? 0u : 1u) : 1u;
+    uint32_t statusP3 = (XHCI_TRB_TYPE_STATUS << XHCI_TRB_TYPE_SHIFT) | (statusDir << 16) | (1u << 5) /* IOC */;
+    xhci_ring_submit(&m->ep0, status, 0, 0, 0, statusP3);
+
+    xhci_doorbell(x, m->slotId, 1); /* DCI 1 = EP0 */
+
+    XhciTrb evt;
+    if (!xhci_event_poll(x, XHCI_TRB_TYPE_TRANSFER_EVENT, m->slotId, &evt, 1000000)) return 0;
+    uint32_t cc = (evt.P2 >> 24) & 0xFF;
+    return cc == 1 /* Success */ || cc == 13 /* Short Packet */;
+}
+
+static int xhci_get_descriptor(XhciController *x, XhciMouse *m, uint8_t type, uint8_t index,
+                                void *buf, uint64_t bufPhys, uint16_t len) {
+    return xhci_control_transfer(x, m, 0x80, 6 /* GET_DESCRIPTOR */, ((uint16_t)type << 8) | index, 0, len, buf, bufPhys);
+}
+
+static int xhci_set_configuration(XhciController *x, XhciMouse *m, uint8_t value) {
+    return xhci_control_transfer(x, m, 0x00, 9 /* SET_CONFIGURATION */, value, 0, 0, NULL, 0);
+}
+
+static int xhci_set_boot_protocol(XhciController *x, XhciMouse *m, uint8_t ifaceNum) {
+    /* HID class request, interface recipient: SET_PROTOCOL(Boot=0) */
+    xhci_control_transfer(x, m, 0x21, 0x0B, 0, ifaceNum, 0, NULL, 0);
+    /* SET_IDLE(0): report only on change, avoids flooding the ring */
+    return xhci_control_transfer(x, m, 0x21, 0x0A, 0, ifaceNum, 0, NULL, 0);
+}
+
+/* Issues Configure Endpoint for the device's interrupt IN endpoint and
+ * stands up its transfer ring. epAddr is the raw bEndpointAddress from
+ * the endpoint descriptor (high bit = direction). */
+static int xhci_configure_intr_endpoint(XhciController *x, XhciMouse *m, uint8_t epAddr, uint16_t maxPacket, uint8_t interval) {
+    g_xhciCfgEpEntered = 1;
+    uint32_t dci = ((uint32_t)(epAddr & 0x0F) * 2) + ((epAddr & 0x80) ? 1u : 0u);
+    m->intrDci = dci;
+    m->intrMaxPacket = maxPacket;
+
+    uint64_t intrRingPhys = 0;
+    XhciTrb *intrRingTrbs = (XhciTrb *)xhci_alloc_pages(1, &intrRingPhys);
+    if (!intrRingTrbs) { g_xhciCfgEpAllocIntrFailed = 1; return 0; }
+    xhci_ring_init(&m->intr, intrRingTrbs, intrRingPhys, XHCI_CMD_RING_TRBS);
+
+    uint64_t reportBufPhys = 0;
+    uint8_t *reportBuf = (uint8_t *)xhci_alloc_pages(1, &reportBufPhys);
+    if (!reportBuf) { g_xhciCfgEpAllocBufFailed = 1; return 0; }
+    m->reportBuf = reportBuf;
+    m->reportBufPhys = reportBufPhys;
+
+    uint32_t ctxSize = x->ctxSize;
+    uint8_t *input = (uint8_t *)m->inputCtx;
+    for (UINTN i = 0; i < 4096; i++) input[i] = 0;
+
+    uint32_t *icc = (uint32_t *)(input + 0);
+    icc[1] = 0x1u | (1u << dci); /* A0 (slot context, entry count changed) | this endpoint */
+
+    uint32_t *slotCtx = (uint32_t *)(input + ctxSize);
+    slotCtx[0] = (dci << 27) | (m->speed << 20);
+    slotCtx[1] = ((m->portNum1 & 0xFF) << 16);
+
+    uint32_t *epCtx = (uint32_t *)(input + (1 + dci) * ctxSize);
+    epCtx[0] = (xhci_encode_interval(m->speed, interval) << 16);
+    epCtx[1] = (7u << 3) | (3u << 1) | ((uint32_t)maxPacket << 16); /* EP Type=Interrupt IN, CErr=3 */
+    uint64_t deq = m->intr.phys | 1u; /* DCS = 1 */
+    epCtx[2] = (uint32_t)(deq & 0xFFFFFFFFu);
+    epCtx[3] = (uint32_t)(deq >> 32);
+    epCtx[4] = (uint32_t)maxPacket;
+
+    XhciTrb *t = xhci_ring_reserve(&x->cmd);
+    uint32_t p3 = (XHCI_TRB_TYPE_CONFIG_ENDPOINT << XHCI_TRB_TYPE_SHIFT) | ((m->slotId & 0xFF) << 24);
+    xhci_ring_submit(&x->cmd, t, (uint32_t)(m->inputCtxPhys & 0xFFFFFFFFu), (uint32_t)(m->inputCtxPhys >> 32), 0, p3);
+    xhci_doorbell(x, 0, 0);
+    XhciTrb evt;
+    g_xhciCfgEpAttempted = 1;
+    g_xhciCfgEpGotEvt = xhci_event_poll(x, XHCI_TRB_TYPE_CMD_COMPLETION, m->slotId, &evt, 1000000);
+    g_xhciCfgEpCC = g_xhciCfgEpGotEvt ? ((evt.P2 >> 24) & 0xFF) : 0xFF;
+    return g_xhciCfgEpGotEvt && g_xhciCfgEpCC == 1;
+}
+
+/* Posts one Normal TRB on the interrupt endpoint's ring pointing at the
+ * shared report buffer, and rings its doorbell. A fresh TRB is posted
+ * every time the previous one completes (see xhci_mouse_poll), so
+ * there is always exactly one read in flight - simpler than pipelining
+ * several, and plenty fast for a mouse. */
+static void xhci_mouse_arm(XhciController *x, XhciMouse *m) {
+    XhciTrb *t = xhci_ring_reserve(&m->intr);
+    uint32_t p3 = (XHCI_TRB_TYPE_NORMAL << XHCI_TRB_TYPE_SHIFT) | (1u << 5) /* IOC */;
+    xhci_ring_submit(&m->intr, t, (uint32_t)(m->reportBufPhys & 0xFFFFFFFFu), (uint32_t)(m->reportBufPhys >> 32),
+                      m->intrMaxPacket, p3);
+    xhci_doorbell(x, m->slotId, m->intrDci);
+    g_xhciMouseArmCount++;
+}
+
+/* Walks a just-fetched configuration descriptor for the first interrupt
+ * IN endpoint, preferring one inside a HID boot-protocol mouse
+ * interface (class 3, subclass 1, protocol 2) but accepting any
+ * interrupt IN endpoint as a fallback, since not every mouse bothers
+ * declaring boot protocol support. Returns 1 and fills the out
+ * parameters if one was found. */
+static int xhci_find_interrupt_in_endpoint(uint8_t *cfg, uint16_t total, uint8_t *epAddrOut, uint16_t *maxPacketOut,
+                                            uint8_t *intervalOut, uint8_t *ifaceNumOut, int *isHidMouseOut) {
+    int found = 0, foundHid = 0;
+    uint8_t curIfaceClass = 0, curIfaceSub = 0, curIfaceProto = 0, curIfaceNum = 0;
+    for (uint16_t off = 0; off + 2 <= total; ) {
+        uint8_t len = cfg[off], type = cfg[off + 1];
+        if (len < 2 || off + len > total) break;
+        if (type == 4 && len >= 9) { /* INTERFACE */
+            curIfaceNum = cfg[off + 2];
+            curIfaceClass = cfg[off + 5];
+            curIfaceSub = cfg[off + 6];
+            curIfaceProto = cfg[off + 7];
+        } else if (type == 5 && len >= 7) { /* ENDPOINT */
+            uint8_t addr = cfg[off + 2];
+            uint8_t attr = cfg[off + 3];
+            if ((addr & 0x80) && (attr & 0x3) == 3) { /* interrupt IN */
+                int isHid = (curIfaceClass == 3 && curIfaceSub == 1 && curIfaceProto == 2);
+                if (!found || (isHid && !foundHid)) {
+                    *epAddrOut = addr;
+                    *maxPacketOut = (uint16_t)(cfg[off + 4] | (cfg[off + 5] << 8));
+                    *intervalOut = cfg[off + 6];
+                    *ifaceNumOut = curIfaceNum;
+                    *isHidMouseOut = isHid;
+                    found = 1;
+                    if (isHid) foundHid = 1;
+                }
+            }
+        }
+        off += len;
+    }
+    return found;
+}
+
+/* Full bring-up for one device on one port: address it, read its
+ * configuration descriptor, set the configuration, switch HID
+ * interfaces into Boot Protocol, configure the interrupt IN endpoint
+ * and start it receiving reports. Returns 1 on success. */
+static int xhci_bring_up_mouse(XhciController *x, XhciMouse *m, uint32_t portNum1, uint32_t speed) {
+    m->slotId = 0;
+    m->portNum1 = portNum1;
+    m->speed = speed;
+    m->maxPacket0 = xhci_ep0_max_packet(speed);
+
+    uint32_t slotId;
+    if (!xhci_enable_slot(x, &slotId)) return 0;
+    m->slotId = slotId;
+    /* Record progress even on eventual failure, so diagnostics show how
+     * far bring-up got rather than just "NONE". */
+    g_xhciMousePort = portNum1;
+    g_xhciMouseSpeed = speed;
+    g_xhciMouseSlot = slotId;
+
+    if (!xhci_address_device(x, m)) return 0;
+
+    uint64_t descPhys = 0;
+    uint8_t *desc = (uint8_t *)xhci_alloc_pages(1, &descPhys);
+    if (!desc) return 0;
+
+    if (!xhci_get_descriptor(x, m, 2 /* CONFIGURATION */, 0, desc, descPhys, 9)) return 0;
+    uint16_t totalLen = (uint16_t)(desc[2] | (desc[3] << 8));
+    if (totalLen < 9) totalLen = 9;
+    if (totalLen > 4096) totalLen = 4096;
+    if (!xhci_get_descriptor(x, m, 2 /* CONFIGURATION */, 0, desc, descPhys, totalLen)) return 0;
+
+    uint8_t configValue = desc[5];
+    uint8_t epAddr = 0, iface = 0, interval = 1;
+    uint16_t maxPacket = 8;
+    int isHid = 0;
+    if (!xhci_find_interrupt_in_endpoint(desc, totalLen, &epAddr, &maxPacket, &interval, &iface, &isHid)) return 0;
+    if (maxPacket == 0 || maxPacket > 64) maxPacket = 8;
+    if (interval == 0) interval = 1;
+    g_xhciMouseEpAddr = epAddr;
+    g_xhciMouseInterval = interval;
+    g_xhciMouseMaxPacket = maxPacket;
+    g_xhciMouseIsHid = (uint32_t)isHid;
+
+    if (!xhci_set_configuration(x, m, configValue)) return 0;
+    if (isHid) xhci_set_boot_protocol(x, m, iface); /* best-effort, don't fail bring-up over it */
+
+    if (!xhci_configure_intr_endpoint(x, m, epAddr, maxPacket, interval)) return 0;
+
+    xhci_mouse_arm(x, m);
+    m->active = 1;
+    return 1;
+}
+
+/* PORTSC mixes RW status-change bits (CSC/PEC/WRC/OCC/PRC/PLC/CEC,
+ * bits 17-23) that clear on a write of 1 with ordinary RW/RO fields.
+ * Writing back a value read straight from the register would silently
+ * clear whichever change bits happened to be set at read time; this
+ * helper always clears that whole range to 0 first (no-op for W1C
+ * bits) and then ORs in only the specific bit(s) the caller actually
+ * wants to change. */
+#define XHCI_PORTSC_RW1C_MASK 0x00FE0000u
+static void xhci_portsc_write(volatile uint32_t *portsc, uint32_t setBits) {
+    uint32_t v = *portsc;
+    v &= ~XHCI_PORTSC_RW1C_MASK;
+    v |= setBits;
+    *portsc = v;
+}
+
+/* Scans every root hub port for a connected device and attempts to
+ * bring up the first one as a mouse. Ports that are connected but
+ * whose link hasn't trained yet get a Port Reset (works uniformly for
+ * USB2 and USB3 ports on xHCI - the controller runs the appropriate
+ * signaling for whichever the port actually is). */
+static int xhci_scan_and_bring_up(XhciController *x) {
+    for (uint32_t p = 0; p < x->maxPorts; p++) {
+        volatile uint32_t *portsc = &x->ports[p].Portsc;
+        uint32_t sc = *portsc;
+        if (!(sc & 0x1)) continue; /* CCS: nothing connected */
+
+        if (!(sc & 0x2)) { /* not yet Port Enabled - reset it */
+            xhci_portsc_write(portsc, (1u << 4)); /* PR */
+            xhci_wait_bits(portsc, (1u << 21), (1u << 21), 500000); /* wait for PRC */
+            xhci_portsc_write(portsc, (1u << 21)); /* clear PRC */
+            sc = *portsc;
+            if (!(sc & 0x2)) continue; /* still not enabled - skip this port */
+        }
+
+        uint32_t speed = (sc >> 10) & 0xF;
+        if (speed == 0) continue;
+
+        XhciMouse m;
+        m.active = 0;
+        if (xhci_bring_up_mouse(x, &m, p + 1, speed)) {
+            g_xhciMouse = m;
+            g_xhciMouseActive = 1;
+            g_xhciMousePort = p + 1;
+            g_xhciMouseSpeed = speed;
+            g_xhciMouseSlot = m.slotId;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Refreshes diagnostic snapshots of the controller-owned Output Device
+ * Context (Slot State, EP State) and the port's live PORTSC - lets us
+ * tell "configured but the xHC never actually started the endpoint"
+ * apart from "started fine, device just isn't sending reports". */
+static void xhci_mouse_refresh_state(XhciController *x, XhciMouse *m) {
+    if (!m->outputCtx) return;
+    uint32_t ctxSize = x->ctxSize;
+    uint32_t *slotCtx = (uint32_t *)((uint8_t *)m->outputCtx + 0);
+    g_xhciOutSlotState = (slotCtx[3] >> 27) & 0x1F;
+    uint32_t *epCtx = (uint32_t *)((uint8_t *)m->outputCtx + (uint64_t)m->intrDci * ctxSize);
+    g_xhciOutEpState = epCtx[0] & 0x7;
+    if (m->portNum1 >= 1 && m->portNum1 <= x->maxPorts) {
+        g_xhciPortscSnapshot = x->ports[m->portNum1 - 1].Portsc;
+    }
+}
+
+/* Called once per frame. If a completed report is waiting, decodes the
+ * standard HID boot mouse layout (buttons, signed dx, signed dy,
+ * optional wheel) and re-arms the endpoint for the next one. */
+static int xhci_mouse_poll(int *dxOut, int *dyOut, int *btnOut) {
+    if (!g_xhciMouse.active) return 0;
+    xhci_mouse_refresh_state(&g_xhci, &g_xhciMouse);
+    XhciTrb evt;
+    if (!xhci_event_poll(&g_xhci, XHCI_TRB_TYPE_TRANSFER_EVENT, g_xhciMouse.slotId, &evt, 0)) return 0;
+    g_xhciMouseEvtCount++;
+    uint32_t cc = (evt.P2 >> 24) & 0xFF;
+    if (cc == 1 || cc == 13) {
+        uint8_t *b = g_xhciMouse.reportBuf;
+        *btnOut = b[0] & 0x01;
+        *dxOut = (int8_t)b[1];
+        *dyOut = (int8_t)b[2];
+    } else {
+        *dxOut = 0; *dyOut = 0; *btnOut = 0;
+    }
+    xhci_mouse_arm(&g_xhci, &g_xhciMouse);
     return 1;
 }
 
@@ -886,6 +1464,15 @@ static void desktop_loop(void) {
 
     g_xhciFound = find_xhci_controller(&g_xhciMmioBase);
     if (g_xhciFound) g_xhciInitOk = xhci_init(g_xhciMmioBase);
+    if (g_xhciInitOk) {
+        /* Ports can take a moment to report CCS after the reset above
+         * (same real-hardware enumeration delay as everywhere else in
+         * this file), so retry for a good while before giving up. */
+        for (int attempt = 0; attempt < 30; attempt++) {
+            if (xhci_scan_and_bring_up(&g_xhci)) break;
+            BS->Stall(300000);
+        }
+    }
 
     mouse_x = (int)screenW / 2;
     mouse_y = (int)screenH / 2;
@@ -907,16 +1494,38 @@ static void desktop_loop(void) {
         int left_now = left_prev;
         int kbClick = 0;
 
+        /* Our own xHCI driver, once it has a mouse configured, is
+         * authoritative - skip UEFI's own pointer protocols entirely
+         * rather than mixing two sources of truth for the same mouse. */
+        if (g_xhciMouse.active) {
+            int dx = 0, dy = 0, btn = 0;
+            if (xhci_mouse_poll(&dx, &dy, &btn)) {
+                g_pointerKind = "XHCI"; g_pollTotal++; g_pollSuccess++;
+                g_lastRawDx = dx; g_lastRawDy = dy; g_lastDivisor = 1; g_lastBtn = btn;
+                if (dx > 60) dx = 60; if (dx < -60) dx = -60;
+                if (dy > 60) dy = 60; if (dy < -60) dy = -60;
+                mouse_x += dx;
+                mouse_y += dy;
+                if (btn) left_now = 1;
+            }
+        }
+
         /* If no pointer device was found yet, keep periodically
          * re-checking - it may appear late (slow enumeration) or get
-         * hot-plugged while the desktop is already running. */
-        if (ptrs.spCount == 0 && ptrs.apCount == 0) {
+         * hot-plugged while the desktop is already running. Our own
+         * xHCI driver gets first refusal at each rescan, since it's
+         * meant to replace the UEFI-protocol fallback whenever it can
+         * actually get a device configured. */
+        if (!g_xhciMouse.active && ptrs.spCount == 0 && ptrs.apCount == 0) {
             rescanCounter++;
             if (rescanCounter >= 100) { /* roughly once a second at the 10ms frame stall below */
                 rescanCounter = 0;
-                connect_all_controllers();
-                find_pointers(&ptrs);
-                g_pointerCount = ptrs.spCount + ptrs.apCount + ptrs.rawCount;
+                if (g_xhciInitOk) xhci_scan_and_bring_up(&g_xhci);
+                if (!g_xhciMouse.active) {
+                    connect_all_controllers();
+                    find_pointers(&ptrs);
+                    g_pointerCount = ptrs.spCount + ptrs.apCount + ptrs.rawCount;
+                }
             }
         }
 
@@ -924,8 +1533,11 @@ static void desktop_loop(void) {
          * firmware without ever being wired to real hardware, so
          * GetState never once returns success no matter how much the
          * mouse actually moves. If that's what happened, stop trusting
-         * it and go straight for the raw USB HID fallback instead. */
-        if (!stuckFallbackTried && ptrs.rawCount == 0 && ptrs.apCount > 0 &&
+         * it and go straight for the raw USB HID fallback instead. Only
+         * relevant when our own xHCI driver didn't already take over -
+         * once it resets the controller, UEFI's own pointer protocol
+         * handles for the same device are stale anyway. */
+        if (!g_xhciMouse.active && !stuckFallbackTried && ptrs.rawCount == 0 && ptrs.apCount > 0 &&
             g_pollTotal >= 150 && g_pollSuccess == 0) {
             stuckFallbackTried = 1;
             find_raw_hid_mice(&ptrs);
@@ -934,7 +1546,7 @@ static void desktop_loop(void) {
             g_pointerCount = ptrs.spCount + ptrs.apCount + ptrs.rawCount;
         }
 
-        for (int i = 0; i < ptrs.spCount; i++) {
+        for (int i = 0; i < (g_xhciMouse.active ? 0 : ptrs.spCount); i++) {
             g_pointerKind = "SP"; g_pollTotal++;
             EFI_SIMPLE_POINTER_STATE st;
             if (ptrs.sp[i]->GetState(ptrs.sp[i], &st) == EFI_SUCCESS) {
@@ -952,7 +1564,7 @@ static void desktop_loop(void) {
                 if (st.LeftButton) left_now = 1;
             }
         }
-        for (int i = 0; i < ptrs.apCount; i++) {
+        for (int i = 0; i < (g_xhciMouse.active ? 0 : ptrs.apCount); i++) {
             g_pointerKind = "AP"; g_pollTotal++;
             EFI_ABSOLUTE_POINTER_STATE st;
             if (ptrs.ap[i]->GetState(ptrs.ap[i], &st) == EFI_SUCCESS) {
@@ -969,7 +1581,7 @@ static void desktop_loop(void) {
                 if (st.ActiveButtons & EFI_ABSOLUTE_POINTER_TOUCH_ACTIVE) left_now = 1;
             }
         }
-        for (int i = 0; i < ptrs.rawCount; i++) {
+        for (int i = 0; i < (g_xhciMouse.active ? 0 : ptrs.rawCount); i++) {
             g_pointerKind = "RAW"; g_pollTotal++;
             uint8_t buf[8];
             UINTN len = 4;
