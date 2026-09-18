@@ -165,14 +165,18 @@ static void draw_menu(int selected, const LogoPoint *logoPts, int logoPtCount, i
     present();
 }
 
-/* Triangle wave 0 -> 1000 -> 0 over `period` frames: the logo
- * assembles, holds briefly, then dissolves back into dots and repeats -
+/* Trapezoid wave: ramps 0 -> 1000 over `rampFrames`, holds at 1000 for
+ * `holdFrames` (so the assembled logo stays put long enough to actually
+ * look at), then ramps back down to 0 over `rampFrames` and repeats -
  * the same "the mark is made of many small points, coming together"
- * motion as Claude's own loading animation. */
-static int triangle_wave1000(uint32_t frame, uint32_t period) {
+ * motion as Claude's own loading animation, just paused at the top. */
+static int trapezoid_wave1000(uint32_t frame, uint32_t rampFrames, uint32_t holdFrames) {
+    uint32_t period = 2 * rampFrames + holdFrames;
     uint32_t t = frame % period;
-    if (t < period / 2) return (int)(t * 1000 / (period / 2));
-    return (int)(1000 - (t - period / 2) * 1000 / (period / 2));
+    if (t < rampFrames) return (int)(t * 1000 / rampFrames);
+    if (t < rampFrames + holdFrames) return 1000;
+    uint32_t td = t - rampFrames - holdFrames;
+    return (int)(1000 - td * 1000 / rampFrames);
 }
 
 /* Accepts either a direct digit press or arrow-key navigation confirmed
@@ -194,7 +198,7 @@ static char wait_for_choice(void) {
             if (key.ScanCode == 2 || key.ScanCode == 3) selected = 1; /* down/right */
             if (key.UnicodeChar == 13 || key.UnicodeChar == ' ') return selected == 0 ? '1' : '2';
         }
-        int phase = triangle_wave1000(frame, 180);
+        int phase = trapezoid_wave1000(frame, 70, 180); /* ~1.2s to assemble, ~3s held, ~1.2s to scatter, at 60fps */
         draw_menu(selected, logoPts, logoPtCount, phase);
         frame++;
         BS->Stall(16000); /* ~60 fps-ish frame pacing */
